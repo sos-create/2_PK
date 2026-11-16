@@ -151,7 +151,14 @@ static bool CountPrimesGpu(uint64_t a,uint64_t b,uint64_t& result){
  IDXGIFactory1* f=nullptr;if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return false;
  std::vector<IDXGIAdapter1*> adapters;
  for(UINT i=0;;++i){IDXGIAdapter1* ad=nullptr;if(f->EnumAdapters1(i,&ad)==DXGI_ERROR_NOT_FOUND)break;
-  DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(ad->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE))adapters.push_back(ad);else ad->Release();
+  DXGI_ADAPTER_DESC1 d{};bool usable=false;
+  if(SUCCEEDED(ad->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){
+   ID3D11Device* probe=nullptr;ID3D11DeviceContext* probeCtx=nullptr;D3D_FEATURE_LEVEL got{};
+   const D3D_FEATURE_LEVEL required[]={D3D_FEATURE_LEVEL_11_0};
+   usable=SUCCEEDED(D3D11CreateDevice(ad,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,required,1,D3D11_SDK_VERSION,&probe,&got,&probeCtx));
+   if(probeCtx)probeCtx->Release();if(probe)probe->Release();
+  }
+  if(usable)adapters.push_back(ad);else ad->Release();
  }
  f->Release();if(adapters.empty())return false;
  std::vector<uint64_t> sums(adapters.size(),0);std::vector<int> ok(adapters.size(),0);std::vector<std::thread> jobs;
