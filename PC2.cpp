@@ -97,19 +97,31 @@ static uint64_t CountPrimesCpu(uint64_t a,uint64_t b){
 }
 static bool CountPrimesGpuOnAdapter(IDXGIAdapter1* adapter,uint64_t a,uint64_t b,uint64_t& result){
  if(b<a)return false;
+ result=0;if(a<=2&&b>=2)++result;if(b<3)return true;
  static const char* shader=R"(
+ StructuredBuffer<uint> BasePrimes : register(t0);
  RWByteAddressBuffer Counter : register(u0);
- cbuffer Params : register(b0) { uint StartValue; uint ItemCount; uint Pad0; uint Pad1; };
+ cbuffer Params : register(b0) { uint StartValue; uint ItemCount; uint PrimeCount; uint Pad0; };
  [numthreads(256,1,1)]
  void main(uint3 tid : SV_DispatchThreadID) {
   uint i=tid.x;if(i>=ItemCount)return;
   uint n=StartValue+i*2;
-  if(n==2){uint oldv;Counter.InterlockedAdd(0,1,oldv);return;}
-  if(n<2||(n&1)==0)return;
+  if(n<3||(n&1)==0)return;
   bool prime=true;
-  [loop] for(uint d=3;d<=n/d;d+=2){if(n%d==0){prime=false;break;}}
+  [loop] for(uint j=0;j<PrimeCount;++j){
+   uint p=BasePrimes[j];if(p>n/p)break;
+   if(n%p==0){prime=false;break;}
+  }
   if(prime){uint oldv;Counter.InterlockedAdd(0,1,oldv);}
  })";
+ std::vector<uint32_t> basePrimes;
+ uint64_t root=1;while(root+1<=b/(root+1))++root;
+ std::vector<uint8_t> sieve((size_t)root+1,1);
+ for(uint64_t p=3;p<=root;p+=2)if(sieve[(size_t)p]){
+  basePrimes.push_back((uint32_t)p);
+  if(p<=root/p)for(uint64_t q=p*p;q<=root;q+=2*p)sieve[(size_t)q]=0;
+ }
+ if(basePrimes.empty())basePrimes.push_back(3);
  ID3D11Device* dev=nullptr;ID3D11DeviceContext* ctx=nullptr;D3D_FEATURE_LEVEL fl{};
  const D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
  HRESULT hr=D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,levels,2,D3D11_SDK_VERSION,&dev,&fl,&ctx);
@@ -117,35 +129,43 @@ static bool CountPrimesGpuOnAdapter(IDXGIAdapter1* adapter,uint64_t a,uint64_t b
  if(FAILED(hr)||!dev||!ctx){if(ctx)ctx->Release();if(dev)dev->Release();return false;}
  ID3DBlob* bytecode=nullptr;ID3DBlob* errors=nullptr;
  hr=D3DCompile(shader,strlen(shader),"2pc_prime_gpu",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&bytecode,&errors);
- if(errors)errors->Release();if(FAILED(hr)||!bytecode){if(bytecode)bytecode->Release();ctx->Release();dev->Release();return false;}
+ if(errors){if(FAILED(hr))OutputDebugStringA((const char*)errors->GetBufferPointer());errors->Release();}
+ if(FAILED(hr)||!bytecode){if(bytecode)bytecode->Release();ctx->Release();dev->Release();return false;}
  ID3D11ComputeShader* cs=nullptr;hr=dev->CreateComputeShader(bytecode->GetBufferPointer(),bytecode->GetBufferSize(),nullptr,&cs);bytecode->Release();
  if(FAILED(hr)){ctx->Release();dev->Release();return false;}
+ ID3D11Buffer* cb=nullptr;ID3D11Buffer* counter=nullptr;ID3D11Buffer* staging=nullptr;ID3D11Buffer* primeBuffer=nullptr;
+ ID3D11UnorderedAccessView* uav=nullptr;ID3D11ShaderResourceView* primeView=nullptr;
  D3D11_BUFFER_DESC cbd{};cbd.ByteWidth=16;cbd.Usage=D3D11_USAGE_DEFAULT;cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
- ID3D11Buffer* cb=nullptr;hr=dev->CreateBuffer(&cbd,nullptr,&cb);
+ hr=dev->CreateBuffer(&cbd,nullptr,&cb);
  D3D11_BUFFER_DESC bd{};bd.ByteWidth=4;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS;bd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
- ID3D11Buffer* counter=nullptr;if(SUCCEEDED(hr))hr=dev->CreateBuffer(&bd,nullptr,&counter);
+ if(SUCCEEDED(hr))hr=dev->CreateBuffer(&bd,nullptr,&counter);
  D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};ud.Format=DXGI_FORMAT_R32_TYPELESS;ud.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;ud.Buffer.FirstElement=0;ud.Buffer.NumElements=1;ud.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_RAW;
- ID3D11UnorderedAccessView* uav=nullptr;if(SUCCEEDED(hr))hr=dev->CreateUnorderedAccessView(counter,&ud,&uav);
+ if(SUCCEEDED(hr))hr=dev->CreateUnorderedAccessView(counter,&ud,&uav);
+ D3D11_BUFFER_DESC pd{};pd.ByteWidth=(UINT)(basePrimes.size()*sizeof(uint32_t));pd.Usage=D3D11_USAGE_IMMUTABLE;pd.BindFlags=D3D11_BIND_SHADER_RESOURCE;pd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;pd.StructureByteStride=sizeof(uint32_t);
+ D3D11_SUBRESOURCE_DATA init{};init.pSysMem=basePrimes.data();
+ if(SUCCEEDED(hr))hr=dev->CreateBuffer(&pd,&init,&primeBuffer);
+ D3D11_SHADER_RESOURCE_VIEW_DESC pvd{};pvd.Format=DXGI_FORMAT_UNKNOWN;pvd.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;pvd.Buffer.FirstElement=0;pvd.Buffer.NumElements=(UINT)basePrimes.size();
+ if(SUCCEEDED(hr))hr=dev->CreateShaderResourceView(primeBuffer,&pvd,&primeView);
  D3D11_BUFFER_DESC sd{};sd.ByteWidth=4;sd.Usage=D3D11_USAGE_STAGING;sd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
- ID3D11Buffer* staging=nullptr;if(SUCCEEDED(hr))hr=dev->CreateBuffer(&sd,nullptr,&staging);
- if(FAILED(hr)){if(staging)staging->Release();if(uav)uav->Release();if(counter)counter->Release();if(cb)cb->Release();cs->Release();ctx->Release();dev->Release();return false;}
- result=0;uint64_t first=a;if(first<3)first=3;if((first&1)==0)++first;
- constexpr uint64_t CHUNK=32768;
- if(a<=2&&b>=2)++result;
+ if(SUCCEEDED(hr))hr=dev->CreateBuffer(&sd,nullptr,&staging);
+ auto cleanup=[&](){if(staging)staging->Release();if(primeView)primeView->Release();if(primeBuffer)primeBuffer->Release();if(uav)uav->Release();if(counter)counter->Release();if(cb)cb->Release();if(cs)cs->Release();if(ctx)ctx->Release();if(dev)dev->Release();};
+ if(FAILED(hr)){cleanup();return false;}
+ uint64_t first=std::max<uint64_t>(a,3);if((first&1)==0)++first;
+ constexpr uint64_t CHUNK=32768;bool success=true;
  for(uint64_t low=first;low<=b;){
   uint64_t count=std::min<uint64_t>(CHUNK,(b-low)/2+1);
-  UINT params[4]={(UINT)low,(UINT)count,0,0};ctx->UpdateSubresource(cb,0,nullptr,params,0,0);
+  UINT params[4]={(UINT)low,(UINT)count,(UINT)basePrimes.size(),0};ctx->UpdateSubresource(cb,0,nullptr,params,0,0);
   UINT zero[4]={0,0,0,0};ctx->ClearUnorderedAccessViewUint(uav,zero);
-  ctx->CSSetShader(cs,nullptr,0);ctx->CSSetConstantBuffers(0,1,&cb);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
+  ctx->CSSetShader(cs,nullptr,0);ctx->CSSetConstantBuffers(0,1,&cb);ctx->CSSetShaderResources(0,1,&primeView);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
   ctx->Dispatch((UINT)((count+255)/256),1,1);
-  ID3D11UnorderedAccessView* nullUav=nullptr;ctx->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+  ID3D11UnorderedAccessView* nullUav=nullptr;ID3D11ShaderResourceView* nullSrv=nullptr;
+  ctx->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);ctx->CSSetShaderResources(0,1,&nullSrv);
   ctx->CopyResource(staging,counter);D3D11_MAPPED_SUBRESOURCE mapped{};
-  hr=ctx->Map(staging,0,D3D11_MAP_READ,0,&mapped);if(FAILED(hr))break;
+  hr=ctx->Map(staging,0,D3D11_MAP_READ,0,&mapped);if(FAILED(hr)){success=false;break;}
   result+=*(const uint32_t*)mapped.pData;ctx->Unmap(staging,0);
   uint64_t next=low+count*2;if(next<=low)break;low=next;
  }
- staging->Release();uav->Release();counter->Release();cb->Release();cs->Release();ctx->Release();dev->Release();
- return SUCCEEDED(hr);
+ cleanup();return success;
 }
 static bool CountPrimesGpu(uint64_t a,uint64_t b,uint64_t& result){
  IDXGIFactory1* f=nullptr;if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return false;
