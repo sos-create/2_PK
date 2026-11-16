@@ -65,9 +65,13 @@ static void ServerLoop(){
 static void RunDistributedTest(){
  SOCKET s;{std::lock_guard<std::mutex>lk(g_sockMutex);s=g_client;}
  if(!g_connected||s==INVALID_SOCKET){MessageBoxW(nullptr,L"Сначала подключите PC2.",L"Нет вычислительного узла",MB_ICONWARNING);return;}
- double localCpu=CpuLoad();double remoteCpu=g_remoteCpu.load();
- double localFree=std::max(5.0,100.0-localCpu),remoteFree=std::max(5.0,100.0-remoteCpu);
+ CpuLoad();std::this_thread::sleep_for(std::chrono::milliseconds(250));double localCpu=CpuLoad();double remoteCpu=g_remoteCpu.load();
+ double localMem=MemoryLoad(),remoteMem=g_remoteMem.load();
+ double localFree=std::max(3.0,100.0-localCpu)*std::max(5.0,100.0-localMem)/100.0;
+ double remoteFree=std::max(3.0,100.0-remoteCpu)*std::max(5.0,100.0-remoteMem)/100.0;
  double remoteShare=remoteFree/(localFree+remoteFree);
+ if(remoteCpu>90.0||remoteMem>92.0)remoteShare=0.10;
+ if(localCpu>92.0&&remoteCpu<80.0&&remoteMem<85.0)remoteShare=0.80;
  remoteShare=std::clamp(remoteShare,0.15,0.80);
  uint64_t startN=2,span=TEST_END-startN+1;
  uint64_t remoteCount=(uint64_t)(span*remoteShare);
@@ -77,11 +81,13 @@ static void RunDistributedTest(){
  auto started=std::chrono::steady_clock::now();
  if(!SendAll(s,"TASK PRIME "+std::to_string(split+1)+" "+std::to_string(TEST_END)+"\n")){g_taskActive=false;Ui(L"Не удалось отправить задачу PC2");return;}
  uint64_t local=CountPrimes(startN,split);
- std::string answer;bool received=ReadLine(s,answer);g_taskActive=false;
+ std::string answer;bool received=false;
+ while(g_running&&g_connected){if(!ReadLine(s,answer))break;if(answer.rfind("HB ",0)==0){std::istringstream hb(answer);std::string tag;double cpu,mem;hb>>tag>>cpu>>mem;if(hb){g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);}continue;}received=true;break;}
+ g_taskActive=false;
  if(!received||answer.rfind("RESULT ",0)!=0){Ui(L"PC2 не вернул результат. Проверьте соединение.");return;}
  uint64_t remote=0;try{remote=std::stoull(answer.substr(7));}catch(...){Ui(L"Некорректный ответ PC2");return;}
  auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
- std::wstringstream out;out<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%, PC2="<<(int)remoteCpu<<L"%, RAM PC2="<<(int)g_remoteMem.load()<<L"%, время="<<ms<<L" мс.";
+ std::wstringstream out;out<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%, PC2="<<(int)remoteCpu<<L"%, RAM PC1="<<(int)localMem<<L"%, RAM PC2="<<(int)remoteMem<<L"%, время="<<ms<<L" мс.";
  Ui(out.str());Log(out.str());
 }
 static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
