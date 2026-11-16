@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <dxgi.h>
+#include <d3d11.h>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -17,6 +18,7 @@
 #pragma comment(lib,"bcrypt.lib")
 #pragma comment(lib,"iphlpapi.lib")
 #pragma comment(lib,"dxgi.lib")
+#pragma comment(lib,"d3d11.lib")
 
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
 static HWND g_ip{},g_pass{},g_status{},g_log{};
@@ -55,13 +57,13 @@ static double CpuLoad(){
 static double MemoryLoad(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?(double)m.dwMemoryLoad:0;}
 static uint64_t AvailableRamMB(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?m.ullAvailPhys/(1024ull*1024ull):0;}
 static unsigned CpuThreads(){return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);}
-struct GpuInventory{unsigned count=0;uint64_t dedicatedMB=0,sharedMB=0;};
+struct GpuInventory{unsigned count=0,computeCount=0;uint64_t dedicatedMB=0,sharedMB=0;};
 static GpuInventory GetGpuInventory(){
  GpuInventory out;IDXGIFactory1*f=nullptr;
  if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return out;
  for(UINT i=0;;++i){IDXGIAdapter1*a=nullptr;if(f->EnumAdapters1(i,&a)==DXGI_ERROR_NOT_FOUND)break;
   DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(a->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){
-   ++out.count;out.dedicatedMB+=d.DedicatedVideoMemory/(1024ull*1024ull);out.sharedMB+=d.SharedSystemMemory/(1024ull*1024ull);
+   ++out.count;out.dedicatedMB+=d.DedicatedVideoMemory/(1024ull*1024ull);out.sharedMB+=d.SharedSystemMemory/(1024ull*1024ull);\n   ID3D11Device* dev=nullptr;ID3D11DeviceContext* ctx=nullptr;D3D_FEATURE_LEVEL obtained{};const D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_11_0,D3D_FEATURE_LEVEL_10_1,D3D_FEATURE_LEVEL_10_0};\n   if(SUCCEEDED(D3D11CreateDevice(a,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,levels,(UINT)_countof(levels),D3D11_SDK_VERSION,&dev,&obtained,&ctx))){if(obtained>=D3D_FEATURE_LEVEL_11_0)++out.computeCount;if(ctx)ctx->Release();if(dev)dev->Release();}
   }a->Release();
  }f->Release();return out;
 }
