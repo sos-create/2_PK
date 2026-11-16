@@ -1,6 +1,8 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <bcrypt.h>
+#include <vector>
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <string>
@@ -10,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #pragma comment(lib,"ws2_32.lib")
+#pragma comment(lib,"bcrypt.lib")
 
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
 static HWND g_ip{},g_pass{},g_status{},g_log{};
@@ -17,6 +20,20 @@ static SOCKET g_socket=INVALID_SOCKET;
 static std::atomic<bool> g_connected{false},g_stop{false};
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
 static void Log(const std::wstring&s){if(g_log)PostMessageW(GetParent(g_log),WM_APP_LOG,0,(LPARAM)new std::wstring(s));}
+
+static std::string Hex(const std::vector<UCHAR>& v){static const char*d="0123456789abcdef";std::string o;o.reserve(v.size()*2);for(UCHAR c:v){o+=d[c>>4];o+=d[c&15];}return o;}
+static bool Unhex(const std::string&s,std::vector<UCHAR>&o){if(s.size()%2||s.size()>128)return false;o.clear();for(size_t i=0;i<s.size();i+=2){auto cv=[](char c)->int{if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;};int x=cv(s[i]),y=cv(s[i+1]);if(x<0||y<0)return false;o.push_back((UCHAR)((x<<4)|y));}return true;}
+static bool HmacSha256(const std::string&key,const std::vector<UCHAR>&data,std::vector<UCHAR>&out){
+ BCRYPT_ALG_HANDLE alg=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;DWORD objLen=0,cb=0;std::vector<UCHAR>obj(1024);out.assign(32,0);
+ if(BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,nullptr,BCRYPT_ALG_HANDLE_HMAC_FLAG)<0)return false;
+ bool ok=BCryptGetProperty(alg,BCRYPT_OBJECT_LENGTH,(PUCHAR)&objLen,sizeof(objLen),&cb,0)>=0;
+ if(ok){obj.resize(objLen);ok=BCryptCreateHash(alg,&hash,obj.data(),objLen,(PUCHAR)key.data(),(ULONG)key.size(),0)>=0;}
+ if(ok)ok=BCryptHashData(hash,(PUCHAR)data.data(),(ULONG)data.size(),0)>=0;
+ if(ok)ok=BCryptFinishHash(hash,out.data(),(ULONG)out.size(),0)>=0;
+ if(hash)BCryptDestroyHash(hash);BCryptCloseAlgorithmProvider(alg,0);return ok;
+}
+static bool MakeProof(const std::string&key,const std::string&nonceHex,std::string&proof){std::vector<UCHAR>nonce,mac;if(!Unhex(nonceHex,nonce)||nonce.size()!=32||!HmacSha256(key,nonce,mac))return false;proof=Hex(mac);return true;}
+
 static bool SendAll(SOCKET s,const std::string&v){size_t p=0;while(p<v.size()){int n=send(s,v.data()+p,(int)(v.size()-p),0);if(n<=0)return false;p+=(size_t)n;}return true;}
 static bool ReadLine(SOCKET s,std::string&out){out.clear();char c;while(out.size()<256){int n=recv(s,&c,1,0);if(n<=0)return false;if(c=='\n')return true;if(c!='\r')out+=c;}return false;}
 static double CpuLoad(){
@@ -53,8 +70,8 @@ static void Connect(){
  if(getaddrinfo(h,"47821",&hints,&res)!=0){Ui(L"Неверный IP");WSACleanup();return;}
  SOCKET s=INVALID_SOCKET;for(auto*q=res;q;q=q->ai_next){s=socket(q->ai_family,q->ai_socktype,q->ai_protocol);if(s!=INVALID_SOCKET&&connect(s,q->ai_addr,(int)q->ai_addrlen)==0)break;if(s!=INVALID_SOCKET)closesocket(s);s=INVALID_SOCKET;}freeaddrinfo(res);
  if(s==INVALID_SOCKET){Ui(L"Не удалось подключиться. Проверьте IP и брандмауэр.");WSACleanup();return;}
- if(!SendAll(s,std::string("HELLO ")+p+"\n")){closesocket(s);WSACleanup();Ui(L"Ошибка отправки авторизации");return;}
- std::string answer;if(!ReadLine(s,answer)||answer!="OK"){closesocket(s);WSACleanup();Ui(L"Пароль не принят");return;}
+ std::string answer;if(!ReadLine(s,answer)||answer.rfind("CHALLENGE ",0)!=0){closesocket(s);WSACleanup();Ui(L"Сервер не прошёл проверку протокола");return;}
+ std::string proof;if(!MakeProof(p,answer.substr(10),proof)||!SendAll(s,"AUTH "+proof+"\n")||!ReadLine(s,answer)||answer!="OK"){closesocket(s);WSACleanup();Ui(L"Пароль не принят или проверка не пройдена");return;}
  g_socket=s;g_stop=false;g_connected=true;Ui(L"Подключено. Отправляю показатели загрузки PC2.");Log(L"Авторизация успешна.");std::thread(Worker,s).detach();
 }
 static void Disconnect(){g_stop=true;SOCKET s=g_socket;g_socket=INVALID_SOCKET;g_connected=false;if(s!=INVALID_SOCKET){shutdown(s,SD_BOTH);closesocket(s);}Ui(L"Отключено");}
