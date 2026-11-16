@@ -34,6 +34,13 @@ static bool HmacSha256(const std::string&key,const std::vector<UCHAR>&data,std::
 }
 static bool MakeProof(const std::string&key,const std::string&nonceHex,std::string&proof){std::vector<UCHAR>nonce,mac;if(!Unhex(nonceHex,nonce)||nonce.size()!=32||!HmacSha256(key,nonce,mac))return false;proof=Hex(mac);return true;}
 
+static void ConfigureSocket(SOCKET s){
+ BOOL yes=TRUE;DWORD timeout=30000;
+ setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,(const char*)&yes,sizeof(yes));
+ setsockopt(s,IPPROTO_TCP,TCP_NODELAY,(const char*)&yes,sizeof(yes));
+ setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,(const char*)&timeout,sizeof(timeout));
+ setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,(const char*)&timeout,sizeof(timeout));
+}
 static bool SendAll(SOCKET s,const std::string&v){size_t p=0;while(p<v.size()){int n=send(s,v.data()+p,(int)(v.size()-p),0);if(n<=0)return false;p+=(size_t)n;}return true;}
 static bool ReadLine(SOCKET s,std::string&out){out.clear();char c;while(out.size()<256){int n=recv(s,&c,1,0);if(n<=0)return false;if(c=='\n')return true;if(c!='\r')out+=c;}return false;}
 static double CpuLoad(){
@@ -89,7 +96,7 @@ static void Connect(){
  addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
  if(getaddrinfo(h,"47821",&hints,&res)!=0){Ui(L"Неверный IP");WSACleanup();return;}
  SOCKET s=INVALID_SOCKET;for(auto*q=res;q;q=q->ai_next){s=socket(q->ai_family,q->ai_socktype,q->ai_protocol);if(s!=INVALID_SOCKET&&connect(s,q->ai_addr,(int)q->ai_addrlen)==0)break;if(s!=INVALID_SOCKET)closesocket(s);s=INVALID_SOCKET;}freeaddrinfo(res);
- if(s==INVALID_SOCKET){Ui(L"Не удалось подключиться. Проверьте IP и брандмауэр.");WSACleanup();return;}
+ if(s==INVALID_SOCKET){Ui(L"Не удалось подключиться. Проверьте IP и брандмауэр.");WSACleanup();return;}ConfigureSocket(s);
  std::string answer;if(!ReadLine(s,answer)||answer.rfind("CHALLENGE ",0)!=0){closesocket(s);WSACleanup();Ui(L"Сервер не прошёл проверку протокола");return;}
  std::string proof;if(!MakeProof(p,answer.substr(10),proof)||!SendAll(s,"AUTH "+proof+"\n")||!ReadLine(s,answer)||answer!="OK"){closesocket(s);WSACleanup();Ui(L"Пароль не принят или проверка не пройдена");return;}
  g_socket=s;g_stop=false;g_connected=true;Ui(L"Подключено. Отправляю показатели загрузки PC2.");Log(L"Авторизация успешна.");std::thread(Worker,s).detach();
