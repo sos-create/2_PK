@@ -82,13 +82,33 @@ static uint64_t CountPrimes(uint64_t a,uint64_t b){
  }
  return total;
 }
+static void DiscoveryLoop(){
+ WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0)return;
+ SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET){WSACleanup();return;}
+ BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
+ sockaddr_in bindAddr{};bindAddr.sin_family=AF_INET;bindAddr.sin_port=htons(47820);bindAddr.sin_addr.s_addr=htonl(INADDR_ANY);
+ if(bind(d,(sockaddr*)&bindAddr,sizeof(bindAddr))==SOCKET_ERROR){closesocket(d);WSACleanup();return;}
+ while(g_running){
+  fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
+  if(ready<=0)continue;
+  char buf[64]{};sockaddr_in peer{};int len=sizeof(peer);
+  int n=recvfrom(d,buf,sizeof(buf)-1,0,(sockaddr*)&peer,&len);
+  if(n<=0)continue;buf[n]=0;
+  if(std::string(buf,n)=="2PC_DISCOVER_V1"){
+   const char reply[]="2PC1_V1 47821";
+   sendto(d,reply,(int)sizeof(reply)-1,0,(sockaddr*)&peer,len);
+  }
+ }
+ closesocket(d);WSACleanup();
+}
 static void ServerLoop(){
  WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Winsock не запустился");g_running=false;return;}
  SOCKET ls=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);if(ls==INVALID_SOCKET){Ui(L"Не удалось создать сокет");WSACleanup();g_running=false;return;}
  g_listener=ls;BOOL yes=TRUE;setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
  sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_port=htons(PORT);addr.sin_addr.s_addr=htonl(INADDR_ANY);
  if(bind(ls,(sockaddr*)&addr,sizeof(addr))==SOCKET_ERROR||listen(ls,1)==SOCKET_ERROR){Ui(L"Порт 47821 занят или заблокирован");closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;return;}
- Ui(L"Сервер запущен. Ожидаю PC2 на порту 47821.");
+ Ui(L"Сервер запущен. Ожидаю PC2; включено автообнаружение по Ethernet.");
+ std::thread discovery(DiscoveryLoop);
  while(g_running){
   SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}ConfigureSocket(c);
   std::string expected,line;int n=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
@@ -109,6 +129,7 @@ static void ServerLoop(){
   {std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client==c)g_client=INVALID_SOCKET;}
   closesocket(c);g_connected=false;Ui(L"PC2 отключён. Ожидаю повторное подключение.");Log(L"Соединение с PC2 закрыто.");
  }
+ if(discovery.joinable())discovery.join();
  if(ls!=INVALID_SOCKET)closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;Ui(L"Сервер остановлен");
 }
 static void RunDistributedTest(){
