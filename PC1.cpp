@@ -32,6 +32,7 @@ struct WorkerSession {
 static std::mutex g_workersMutex;
 static std::vector<std::shared_ptr<WorkerSession>> g_workers;
 static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
+static std::atomic<int> g_handlerCount{0};
 static std::wstring g_pass=L"change-this-password";
 
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
@@ -127,10 +128,12 @@ static void ServerLoop(){
   fd_set set;FD_ZERO(&set);FD_SET(ls,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
   if(ready==SOCKET_ERROR)break;if(ready==0)continue;
   SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET)continue;ConfigureSocket(c);
-  std::thread(WorkerSessionLoop,c).detach();
+  ++g_handlerCount;std::thread([c](){WorkerSessionLoop(c);--g_handlerCount;}).detach();
  }
  shutdown(ls,SD_BOTH);closesocket(ls);g_listener=INVALID_SOCKET;
- {std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);closesocket(n->socket);}g_workers.clear();g_connected=false;}
+ {std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);}g_connected=false;}
+ while(g_handlerCount.load()>0)std::this_thread::sleep_for(std::chrono::milliseconds(50));
+ {std::lock_guard<std::mutex>lk(g_workersMutex);g_workers.clear();}
  WSACleanup();g_running=false;Ui(L"Сервер остановлен");
 }
 static void RunDistributedTest(){
@@ -181,11 +184,11 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
   g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,180,540,210,w,nullptr,nullptr,nullptr);return 0;
  case WM_COMMAND:
   if(LOWORD(wp)==1&&!g_running){wchar_t b[256]{};GetWindowTextW(g_password,b,256);if(wcslen(b)<8){MessageBoxW(w,L"Пароль должен содержать не менее 8 символов.",L"Слабый пароль",MB_ICONWARNING);return 0;}g_pass=b;g_running=true;std::thread(ServerLoop).detach();}
-  if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}std::lock_guard<std::mutex>lk(g_sockMutex);{std::lock_guard<std::mutex>lk2(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);closesocket(n->socket);}g_workers.clear();g_connected=false;}}
-  if(LOWORD(wp)==3)std::thread(RunDistributedTest).detach();return 0;
+  if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET)shutdown(g_listener,SD_BOTH);{std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);}g_connected=false;}}
+  if(LOWORD(wp)==3){bool expected=false;if(g_taskActive.compare_exchange_strong(expected,true)){g_taskActive=false;std::thread(RunDistributedTest).detach();}else MessageBoxW(w,L"Задача уже выполняется.",L"Занято",MB_ICONINFORMATION);}return 0;
  case WM_DESTROY:
-  g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}
-  {std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);closesocket(n->socket);}g_workers.clear();g_connected=false;}
+  g_running=false;if(g_listener!=INVALID_SOCKET)shutdown(g_listener,SD_BOTH);
+  {std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);}g_connected=false;}
   PostQuitMessage(0);return 0;
  }return DefWindowProcW(w,m,wp,lp);
 }
