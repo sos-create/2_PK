@@ -223,30 +223,38 @@ static uint64_t CountPrimes(uint64_t a,uint64_t b){
  return left+right;
 }
 static void DiscoveryLoop(){
- WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0)return;
- SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET){WSACleanup();return;}
- BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
+ WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Log(L"UDP discovery: Winsock не запустился.");return;}
+ SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET){Log(L"UDP discovery: не удалось создать сокет.");WSACleanup();return;}
+ BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_REUSEADDR,(const char*)&yes,sizeof(yes));
  sockaddr_in bindAddr{};bindAddr.sin_family=AF_INET;bindAddr.sin_port=htons(47820);bindAddr.sin_addr.s_addr=htonl(INADDR_ANY);
- if(bind(d,(sockaddr*)&bindAddr,sizeof(bindAddr))==SOCKET_ERROR){closesocket(d);WSACleanup();return;}
+ if(bind(d,(sockaddr*)&bindAddr,sizeof(bindAddr))==SOCKET_ERROR){Log(L"UDP discovery: не удалось открыть порт 47820. Возможно, порт занят.");closesocket(d);WSACleanup();return;}
+ Log(L"UDP discovery готов: ожидание широковещательного запроса PC2 на порту 47820.");
  while(g_running){
   fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
+  if(ready==SOCKET_ERROR)break;
   if(ready<=0)continue;
   char buf[64]{};sockaddr_in peer{};int len=sizeof(peer);
   int n=recvfrom(d,buf,sizeof(buf)-1,0,(sockaddr*)&peer,&len);
   if(n<=0)continue;buf[n]=0;
   if(std::string(buf,n)=="2PC_DISCOVER_V1"){
    const char reply[]="2PC1_V1 47821";
-   sendto(d,reply,(int)sizeof(reply)-1,0,(sockaddr*)&peer,len);
+   if(sendto(d,reply,(int)sizeof(reply)-1,0,(sockaddr*)&peer,len)==SOCKET_ERROR)Log(L"UDP discovery: не удалось отправить ответ PC2.");
+   else Log(L"Запрос PC2 получен; отправлен ответ автообнаружения.");
   }
  }
  closesocket(d);WSACleanup();
 }
 static bool EnsureFirewallRules(){
- const wchar_t* args=L"/c netsh advfirewall firewall add rule name=\"2-PC PC1 TCP 47821\" dir=in action=allow protocol=TCP localport=47821 profile=any & netsh advfirewall firewall add rule name=\"2-PC PC1 UDP 47820\" dir=in action=allow protocol=UDP localport=47820 profile=any";
+ const wchar_t* args=L"/c netsh advfirewall firewall add rule name=\"2-PC PC1 TCP 47821\" dir=in action=allow protocol=TCP localport=47821 profile=any && netsh advfirewall firewall add rule name=\"2-PC PC1 UDP 47820\" dir=in action=allow protocol=UDP localport=47820 profile=any";
  SHELLEXECUTEINFOW se{};se.cbSize=sizeof(se);se.fMask=SEE_MASK_NOCLOSEPROCESS;se.lpVerb=L"runas";se.lpFile=L"cmd.exe";se.lpParameters=args;se.nShow=SW_HIDE;
  if(!ShellExecuteExW(&se))return false;
- if(se.hProcess){WaitForSingleObject(se.hProcess,20000);DWORD code=1;GetExitCodeProcess(se.hProcess,&code);CloseHandle(se.hProcess);return code==0;}
- return false;
+ if(!se.hProcess)return false;
+ DWORD wait=WaitForSingleObject(se.hProcess,30000);
+ DWORD code=1;
+ if(wait==WAIT_OBJECT_0)GetExitCodeProcess(se.hProcess,&code);
+ else TerminateProcess(se.hProcess,1);
+ CloseHandle(se.hProcess);
+ return wait==WAIT_OBJECT_0&&code==0;
 }
 static void ServerLoop(){
  WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Winsock не запустился");g_running=false;return;}
