@@ -1,7 +1,6 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
-#include <bcrypt.h>
 #include <vector>
 #include <windows.h>
 #include <ws2tcpip.h>
@@ -15,30 +14,16 @@
 #include <chrono>
 #include <cstdint>
 #pragma comment(lib,"ws2_32.lib")
-#pragma comment(lib,"bcrypt.lib")
 #pragma comment(lib,"iphlpapi.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"d3d11.lib")
 
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
-static HWND g_ip{},g_pass{},g_status{},g_log{};
+static HWND g_ip{},g_status{},g_log{};
 static SOCKET g_socket=INVALID_SOCKET;
 static std::atomic<bool> g_connected{false},g_stop{false};
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
 static void Log(const std::wstring&s){if(g_log)PostMessageW(GetParent(g_log),WM_APP_LOG,0,(LPARAM)new std::wstring(s));}
-
-static std::string Hex(const std::vector<UCHAR>& v){static const char*d="0123456789abcdef";std::string o;o.reserve(v.size()*2);for(UCHAR c:v){o+=d[c>>4];o+=d[c&15];}return o;}
-static bool Unhex(const std::string&s,std::vector<UCHAR>&o){if(s.size()%2||s.size()>128)return false;o.clear();for(size_t i=0;i<s.size();i+=2){auto cv=[](char c)->int{if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;};int x=cv(s[i]),y=cv(s[i+1]);if(x<0||y<0)return false;o.push_back((UCHAR)((x<<4)|y));}return true;}
-static bool HmacSha256(const std::string&key,const std::vector<UCHAR>&data,std::vector<UCHAR>&out){
- BCRYPT_ALG_HANDLE alg=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;DWORD objLen=0,cb=0;std::vector<UCHAR>obj(1024);out.assign(32,0);
- if(BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,nullptr,BCRYPT_ALG_HANDLE_HMAC_FLAG)<0)return false;
- bool ok=BCryptGetProperty(alg,BCRYPT_OBJECT_LENGTH,(PUCHAR)&objLen,sizeof(objLen),&cb,0)>=0;
- if(ok){obj.resize(objLen);ok=BCryptCreateHash(alg,&hash,obj.data(),objLen,(PUCHAR)key.data(),(ULONG)key.size(),0)>=0;}
- if(ok)ok=BCryptHashData(hash,(PUCHAR)data.data(),(ULONG)data.size(),0)>=0;
- if(ok)ok=BCryptFinishHash(hash,out.data(),(ULONG)out.size(),0)>=0;
- if(hash)BCryptDestroyHash(hash);BCryptCloseAlgorithmProvider(alg,0);return ok;
-}
-static bool MakeProof(const std::string&key,const std::string&nonceHex,std::string&proof){std::vector<UCHAR>nonce,mac;if(!Unhex(nonceHex,nonce)||nonce.size()!=32||!HmacSha256(key,nonce,mac))return false;proof=Hex(mac);return true;}
 
 static void ConfigureSocket(SOCKET s){
  BOOL yes=TRUE;DWORD timeout=30000;
@@ -70,7 +55,7 @@ static GpuInventory GetGpuInventory(){
  }f->Release();return out;
 }
 static std::string MakeHeartbeat(){
- auto g=GetGpuInventory();std::ostringstream hb;hb<<"HB "<<CpuLoad()<<" "<<MemoryLoad()<<" "<<CpuThreads()<<" "<<AvailableRamMB()<<" "<<g.count<<" "<<g.dedicatedMB<<" "<<g.sharedMB<<" "<<g.computeCount<<"\n";return hb.str();
+ static const GpuInventory g=GetGpuInventory();std::ostringstream hb;hb<<"HB "<<CpuLoad()<<" "<<MemoryLoad()<<" "<<CpuThreads()<<" "<<AvailableRamMB()<<" "<<g.count<<" "<<g.dedicatedMB<<" "<<g.sharedMB<<" "<<g.computeCount<<"\n";return hb.str();
 }
 static uint64_t CountPrimes(uint64_t a,uint64_t b){
  if(b<a||b<2)return 0;a=std::max<uint64_t>(a,2);
@@ -119,7 +104,7 @@ static bool DiscoverPC1(std::string& found){
  ULONG rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);
  if(rc==ERROR_BUFFER_OVERFLOW){storage.resize(bytes);first=(IP_ADAPTER_ADDRESSES*)storage.data();rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);}
  if(rc==NO_ERROR)for(auto*ad=first;ad;ad=ad->Next){
-  if(ad->OperStatus!=IfOperStatusUp)continue;
+  if(ad->OperStatus!=IfOperStatusUp||ad->IfType!=IF_TYPE_ETHERNET_CSMACD)continue;
   for(auto*u=ad->FirstUnicastAddress;u;u=u->Next){
    if(!u->Address.lpSockaddr||u->Address.lpSockaddr->sa_family!=AF_INET)continue;
    auto*ip=(sockaddr_in*)u->Address.lpSockaddr;uint32_t host=ntohl(ip->sin_addr.s_addr);
@@ -139,21 +124,18 @@ static bool DiscoverPC1(std::string& found){
  closesocket(d);return false;
 }
 static void Connect(){
- if(g_connected)return;wchar_t host[256]{},pw[256]{};GetWindowTextW(g_ip,host,256);GetWindowTextW(g_pass,pw,256);
- if(wcslen(pw)<8){Ui(L"Введите пароль не короче 8 символов");return;}
+ if(g_connected)return;wchar_t host[256]{};GetWindowTextW(g_ip,host,256);
  WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Ошибка Winsock");return;}
  if(!host[0]||_wcsicmp(host,L"AUTO")==0){std::string found;Ui(L"Автоматически ищу PC1 по Ethernet...");
   if(!DiscoverPC1(found)){WSACleanup();Ui(L"PC1 не найден. Проверьте кабель и запущенный сервер.");return;}
   MultiByteToWideChar(CP_UTF8,0,found.c_str(),-1,host,256);SetWindowTextW(g_ip,host);
  }
- char h[256]{},p[256]{};WideCharToMultiByte(CP_UTF8,0,host,-1,h,256,nullptr,nullptr);WideCharToMultiByte(CP_UTF8,0,pw,-1,p,256,nullptr,nullptr);
+ char h[256]{};WideCharToMultiByte(CP_UTF8,0,host,-1,h,256,nullptr,nullptr);
  addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
  if(getaddrinfo(h,"47821",&hints,&res)!=0){Ui(L"Неверный IP");WSACleanup();return;}
  SOCKET s=INVALID_SOCKET;for(auto*q=res;q;q=q->ai_next){s=socket(q->ai_family,q->ai_socktype,q->ai_protocol);if(s!=INVALID_SOCKET&&connect(s,q->ai_addr,(int)q->ai_addrlen)==0)break;if(s!=INVALID_SOCKET)closesocket(s);s=INVALID_SOCKET;}freeaddrinfo(res);
  if(s==INVALID_SOCKET){Ui(L"Не удалось подключиться. Проверьте IP и брандмауэр.");WSACleanup();return;}ConfigureSocket(s);
- std::string answer;if(!ReadLine(s,answer)||answer.rfind("CHALLENGE ",0)!=0){closesocket(s);WSACleanup();Ui(L"Сервер не прошёл проверку протокола");return;}
- std::string proof;if(!MakeProof(p,answer.substr(10),proof)||!SendAll(s,"AUTH "+proof+"\n")||!ReadLine(s,answer)||answer!="OK"){closesocket(s);WSACleanup();Ui(L"Пароль не принят или проверка не пройдена");return;}
- g_socket=s;g_stop=false;g_connected=true;Ui(L"Подключено. Отправляю показатели загрузки PC2.");Log(L"Авторизация успешна.");std::thread(Worker,s).detach();
+ g_socket=s;g_stop=false;g_connected=true;Ui(L"Подключено напрямую по Ethernet без пароля.");Log(L"Прямое Ethernet-соединение установлено.");std::thread(Worker,s).detach();
 }
 static void Disconnect(){g_stop=true;SOCKET s=g_socket;g_socket=INVALID_SOCKET;g_connected=false;if(s!=INVALID_SOCKET){shutdown(s,SD_BOTH);closesocket(s);}Ui(L"Отключено");}
 static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
@@ -164,12 +146,10 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
   CreateWindowW(L"STATIC",L"PC2 — адаптивный вычислительный узел",WS_CHILD|WS_VISIBLE,20,15,500,25,w,nullptr,nullptr,nullptr);
   CreateWindowW(L"STATIC",L"IP PC1 (AUTO — поиск по Ethernet):",WS_CHILD|WS_VISIBLE,20,53,130,22,w,nullptr,nullptr,nullptr);
   g_ip=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"AUTO",WS_CHILD|WS_VISIBLE,155,50,200,25,w,(HMENU)10,nullptr,nullptr);
-  CreateWindowW(L"STATIC",L"Общий пароль:",WS_CHILD|WS_VISIBLE,20,88,120,22,w,nullptr,nullptr,nullptr);
-  g_pass=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"change-this-password",WS_CHILD|WS_VISIBLE|ES_PASSWORD,155,85,200,25,w,(HMENU)11,nullptr,nullptr);
-  CreateWindowW(L"BUTTON",L"Подключиться",WS_CHILD|WS_VISIBLE,20,125,140,32,w,(HMENU)1,nullptr,nullptr);
-  CreateWindowW(L"BUTTON",L"Отключиться",WS_CHILD|WS_VISIBLE,170,125,140,32,w,(HMENU)2,nullptr,nullptr);
-  g_status=CreateWindowW(L"STATIC",L"Не подключено",WS_CHILD|WS_VISIBLE,20,170,540,35,w,nullptr,nullptr,nullptr);
-  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,212,540,178,w,nullptr,nullptr,nullptr);return 0;
+  CreateWindowW(L"BUTTON",L"Подключиться",WS_CHILD|WS_VISIBLE,20,88,140,32,w,(HMENU)1,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Отключиться",WS_CHILD|WS_VISIBLE,170,88,140,32,w,(HMENU)2,nullptr,nullptr);
+  g_status=CreateWindowW(L"STATIC",L"Не подключено",WS_CHILD|WS_VISIBLE,20,133,540,35,w,nullptr,nullptr,nullptr);
+  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,175,540,215,w,nullptr,nullptr,nullptr);return 0;
  case WM_COMMAND:if(LOWORD(wp)==1)std::thread(Connect).detach();if(LOWORD(wp)==2)Disconnect();return 0;
  case WM_DESTROY:Disconnect();PostQuitMessage(0);return 0;
  }return DefWindowProcW(w,m,wp,lp);
