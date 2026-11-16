@@ -5,6 +5,7 @@
 #include <vector>
 #include <windows.h>
 #include <ws2tcpip.h>
+#include <dxgi.h>
 #include <string>
 #include <thread>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"bcrypt.lib")
+#pragma comment(lib,"dxgi.lib")
 
 static constexpr unsigned short PORT=47821;
 static constexpr uint64_t TEST_END=3000000;
@@ -24,6 +26,8 @@ static SOCKET g_client=INVALID_SOCKET,g_listener=INVALID_SOCKET;
 static std::mutex g_sockMutex;
 static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
 static std::atomic<double> g_remoteCpu{45.0},g_remoteMem{0.0};
+static std::atomic<uint64_t> g_remoteRamMB{0},g_remoteVramMB{0},g_remoteSharedGpuMB{0};
+static std::atomic<unsigned> g_remoteThreads{0},g_remoteGpuCount{0};
 static std::wstring g_pass=L"change-this-password";
 
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
@@ -60,6 +64,18 @@ static double CpuLoad(){
  oldIdle=ni;oldKernel=nk;oldUser=nu;return std::clamp(result,0.0,100.0);
 }
 static double MemoryLoad(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?(double)m.dwMemoryLoad:0.0;}
+static uint64_t AvailableRamMB(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?m.ullAvailPhys/(1024ull*1024ull):0;}
+static unsigned CpuThreads(){return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);}
+struct GpuInventory{unsigned count=0;uint64_t dedicatedMB=0,sharedMB=0;};
+static GpuInventory GetGpuInventory(){
+ GpuInventory out;IDXGIFactory1*f=nullptr;
+ if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return out;
+ for(UINT i=0;;++i){IDXGIAdapter1*a=nullptr;if(f->EnumAdapters1(i,&a)==DXGI_ERROR_NOT_FOUND)break;
+  DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(a->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){
+   ++out.count;out.dedicatedMB+=d.DedicatedVideoMemory/(1024ull*1024ull);out.sharedMB+=d.SharedSystemMemory/(1024ull*1024ull);
+  }a->Release();
+ }f->Release();return out;
+}
 static uint64_t CountPrimes(uint64_t a,uint64_t b){
  if(b<a||b<2)return 0;a=std::max<uint64_t>(a,2);
  uint64_t root=1;while(root+1<=b/(root+1))++root;
@@ -124,7 +140,7 @@ static void ServerLoop(){
    if(g_taskActive){std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
    fd_set set;FD_ZERO(&set);FD_SET(c,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
    if(ready==SOCKET_ERROR)break;
-   if(ready>0){if(!ReadLine(c,line))break;std::istringstream in(line);std::string cmd;double cpu,mem;in>>cmd>>cpu>>mem;if(cmd=="HB"&&in){g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);}}
+   if(ready>0){if(!ReadLine(c,line))break;std::istringstream in(line);std::string cmd;double cpu,mem;in>>cmd>>cpu>>mem;if(cmd=="HB"&&in){unsigned threads=0,gpus=0;uint64_t ram=0,vram=0,shared=0;in>>threads>>ram>>gpus>>vram>>shared;g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);g_remoteThreads=threads;g_remoteRamMB=ram;g_remoteGpuCount=gpus;g_remoteVramMB=vram;g_remoteSharedGpuMB=shared;}}
   }
   {std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client==c)g_client=INVALID_SOCKET;}
   closesocket(c);g_connected=false;Ui(L"PC2 отключён. Ожидаю повторное подключение.");Log(L"Соединение с PC2 закрыто.");
@@ -152,12 +168,12 @@ static void RunDistributedTest(){
  if(!SendAll(s,"TASK PRIME "+std::to_string(split+1)+" "+std::to_string(TEST_END)+"\n")){g_taskActive=false;Ui(L"Не удалось отправить задачу PC2");return;}
  uint64_t local=CountPrimes(startN,split);
  std::string answer;bool received=false;
- while(g_running&&g_connected){if(!ReadLine(s,answer))break;if(answer.rfind("HB ",0)==0){std::istringstream hb(answer);std::string tag;double cpu,mem;hb>>tag>>cpu>>mem;if(hb){g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);}continue;}received=true;break;}
+ while(g_running&&g_connected){if(!ReadLine(s,answer))break;if(answer.rfind("HB ",0)==0){std::istringstream hb(answer);std::string tag;double cpu,mem;hb>>tag>>cpu>>mem;if(hb){unsigned threads=0,gpus=0;uint64_t ram=0,vram=0,shared=0;hb>>threads>>ram>>gpus>>vram>>shared;g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);g_remoteThreads=threads;g_remoteRamMB=ram;g_remoteGpuCount=gpus;g_remoteVramMB=vram;g_remoteSharedGpuMB=shared;}continue;}received=true;break;}
  g_taskActive=false;
  if(!received||answer.rfind("RESULT ",0)!=0){Ui(L"PC2 не вернул результат. Проверьте соединение.");return;}
  uint64_t remote=0;try{remote=std::stoull(answer.substr(7));}catch(...){Ui(L"Некорректный ответ PC2");return;}
  auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
- std::wstringstream out;out<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%, PC2="<<(int)remoteCpu<<L"%, RAM PC1="<<(int)localMem<<L"%, RAM PC2="<<(int)remoteMem<<L"%, время="<<ms<<L" мс.";
+ auto localGpu=GetGpuInventory();std::wstringstream out;out<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%/"<<CpuThreads()<<L" потоков, PC2="<<(int)remoteCpu<<L"%/"<<g_remoteThreads.load()<<L" потоков, RAM доступно PC1="<<AvailableRamMB()<<L" МБ, PC2="<<g_remoteRamMB.load()<<L" МБ, GPU PC1="<<localGpu.count<<L" ("<<localGpu.dedicatedMB<<L" МБ VRAM), PC2="<<g_remoteGpuCount.load()<<L" ("<<g_remoteVramMB.load()<<L" МБ VRAM), время="<<ms<<L" мс.";
  Ui(out.str());Log(out.str());
 }
 static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
