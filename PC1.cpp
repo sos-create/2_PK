@@ -42,6 +42,13 @@ static bool HmacSha256(const std::string&key,const std::vector<UCHAR>&data,std::
 }
 static bool MakeProof(const std::string&key,const std::string&nonceHex,std::string&proof){std::vector<UCHAR>nonce,mac;if(!Unhex(nonceHex,nonce)||nonce.size()!=32||!HmacSha256(key,nonce,mac))return false;proof=Hex(mac);return true;}
 
+static void ConfigureSocket(SOCKET s){
+ BOOL yes=TRUE;DWORD timeout=30000;
+ setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,(const char*)&yes,sizeof(yes));
+ setsockopt(s,IPPROTO_TCP,TCP_NODELAY,(const char*)&yes,sizeof(yes));
+ setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,(const char*)&timeout,sizeof(timeout));
+ setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,(const char*)&timeout,sizeof(timeout));
+}
 static bool SendAll(SOCKET s,const std::string&v){size_t p=0;while(p<v.size()){int n=send(s,v.data()+p,(int)(v.size()-p),0);if(n<=0)return false;p+=(size_t)n;}return true;}
 static bool ReadLine(SOCKET s,std::string&out){out.clear();char c;while(out.size()<256){int n=recv(s,&c,1,0);if(n<=0)return false;if(c=='\n')return true;if(c!='\r')out+=c;}return false;}
 static double CpuLoad(){
@@ -83,7 +90,7 @@ static void ServerLoop(){
  if(bind(ls,(sockaddr*)&addr,sizeof(addr))==SOCKET_ERROR||listen(ls,1)==SOCKET_ERROR){Ui(L"Порт 47821 занят или заблокирован");closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;return;}
  Ui(L"Сервер запущен. Ожидаю PC2 на порту 47821.");
  while(g_running){
-  SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}
+  SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}ConfigureSocket(c);
   std::string expected,line;int n=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
   if(n>1){expected.resize(n);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),n,nullptr,nullptr);expected.resize(n-1);}
   std::vector<UCHAR> nonce(32);if(BCryptGenRandom(nullptr,nonce.data(),(ULONG)nonce.size(),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0){closesocket(c);continue;}
