@@ -24,7 +24,7 @@
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
 static HWND g_ip{},g_status{},g_log{};
 static SOCKET g_socket=INVALID_SOCKET;
-static std::atomic<bool> g_connected{false},g_stop{false};
+static std::atomic<bool> g_connected{false},g_stop{false},g_connecting{false};
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
 static void Log(const std::wstring&s){if(g_log)PostMessageW(GetParent(g_log),WM_APP_LOG,0,(LPARAM)new std::wstring(s));}
 
@@ -224,18 +224,32 @@ static bool DiscoverPC1(std::string& found){
  closesocket(d);return false;
 }
 static void Connect(){
- if(g_connected)return;wchar_t host[256]{};GetWindowTextW(g_ip,host,256);
- WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Ошибка Winsock");return;}
- if(!host[0]||_wcsicmp(host,L"AUTO")==0){std::string found;Ui(L"Автоматически ищу PC1 по Ethernet...");
-  if(!DiscoverPC1(found)){WSACleanup();Ui(L"PC1 не найден. Проверьте кабель и запущенный сервер.");return;}
-  MultiByteToWideChar(CP_UTF8,0,found.c_str(),-1,host,256);SetWindowTextW(g_ip,host);
+ if(g_connected||g_connecting.exchange(true))return;
+ g_stop=false;
+ while(!g_stop&&!g_connected){
+  wchar_t host[256]{};GetWindowTextW(g_ip,host,256);
+  WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Ошибка Winsock. Повторяю попытку...");std::this_thread::sleep_for(std::chrono::seconds(2));continue;}
+  if(!host[0]||_wcsicmp(host,L"AUTO")==0){
+   std::string found;Ui(L"Ищу PC1 по прямому Ethernet-соединению...");
+   if(!DiscoverPC1(found)){WSACleanup();if(!g_stop){Ui(L"PC1 пока не найден. Автоматически повторяю поиск...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;}
+   MultiByteToWideChar(CP_UTF8,0,found.c_str(),-1,host,256);SetWindowTextW(g_ip,host);
+  }
+  char h[256]{};WideCharToMultiByte(CP_UTF8,0,host,-1,h,256,nullptr,nullptr);
+  addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
+  if(getaddrinfo(h,"47821",&hints,&res)!=0){WSACleanup();if(!g_stop){Ui(L"Не удалось определить адрес PC1. Повторяю поиск...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;}
+  SOCKET sock=INVALID_SOCKET;
+  for(auto*q=res;q;q=q->ai_next){
+   sock=socket(q->ai_family,q->ai_socktype,q->ai_protocol);
+   if(sock!=INVALID_SOCKET&&connect(sock,q->ai_addr,(int)q->ai_addrlen)==0)break;
+   if(sock!=INVALID_SOCKET)closesocket(sock);sock=INVALID_SOCKET;
+  }
+  freeaddrinfo(res);
+  if(sock==INVALID_SOCKET){WSACleanup();if(!g_stop){Ui(L"PC1 найден, но TCP-соединение не установлено. Повторяю...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;}
+  ConfigureSocket(sock);g_socket=sock;g_connected=true;g_connecting=false;
+  Ui(L"Подключено напрямую по Ethernet. Автопереподключение включено.");
+  Log(L"Прямое Ethernet-соединение установлено.");std::thread(Worker,sock).detach();return;
  }
- char h[256]{};WideCharToMultiByte(CP_UTF8,0,host,-1,h,256,nullptr,nullptr);
- addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
- if(getaddrinfo(h,"47821",&hints,&res)!=0){Ui(L"Неверный IP");WSACleanup();return;}
- SOCKET s=INVALID_SOCKET;for(auto*q=res;q;q=q->ai_next){s=socket(q->ai_family,q->ai_socktype,q->ai_protocol);if(s!=INVALID_SOCKET&&connect(s,q->ai_addr,(int)q->ai_addrlen)==0)break;if(s!=INVALID_SOCKET)closesocket(s);s=INVALID_SOCKET;}freeaddrinfo(res);
- if(s==INVALID_SOCKET){Ui(L"Не удалось подключиться. Проверьте IP и брандмауэр.");WSACleanup();return;}ConfigureSocket(s);
- g_socket=s;g_stop=false;g_connected=true;Ui(L"Подключено напрямую по Ethernet без пароля.");Log(L"Прямое Ethernet-соединение установлено.");std::thread(Worker,s).detach();
+ g_connecting=false;
 }
 static void Disconnect(){g_stop=true;SOCKET s=g_socket;g_socket=INVALID_SOCKET;g_connected=false;if(s!=INVALID_SOCKET){shutdown(s,SD_BOTH);closesocket(s);}Ui(L"Отключено");}
 static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
