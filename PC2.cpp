@@ -232,46 +232,80 @@ static void Worker(SOCKET s){
  g_connected=false;g_socket=INVALID_SOCKET;closesocket(s);WSACleanup();if(!g_stop){Ui(L"Связь потеряна. Автоматически переподключаюсь...");std::this_thread::sleep_for(std::chrono::seconds(1));std::thread(Connect).detach();}
 }
 static bool DiscoverPC1(std::string& found){
- SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET)return false;
- BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_BROADCAST,(const char*)&yes,sizeof(yes));
- DWORD bytes=15000;std::vector<unsigned char> storage(bytes);
+ struct ScanTarget{in_addr local;in_addr broadcast;};
+ std::vector<ScanTarget> targets;
+ ULONG bytes=16000;
+ std::vector<unsigned char> storage(bytes);
  IP_ADAPTER_ADDRESSES* first=(IP_ADAPTER_ADDRESSES*)storage.data();
  ULONG rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);
  if(rc==ERROR_BUFFER_OVERFLOW){storage.resize(bytes);first=(IP_ADAPTER_ADDRESSES*)storage.data();rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);}
- if(rc==NO_ERROR)for(auto*ad=first;ad;ad=ad->Next){
-  if(ad->OperStatus!=IfOperStatusUp||ad->IfType!=IF_TYPE_ETHERNET_CSMACD)continue;
+ if(rc!=NO_ERROR)return false;
+ for(auto*ad=first;ad;ad=ad->Next){
+  if(ad->OperStatus!=IfOperStatusUp||ad->IfType==IF_TYPE_SOFTWARE_LOOPBACK)continue;
   for(auto*u=ad->FirstUnicastAddress;u;u=u->Next){
    if(!u->Address.lpSockaddr||u->Address.lpSockaddr->sa_family!=AF_INET)continue;
-   auto*ip=(sockaddr_in*)u->Address.lpSockaddr;uint32_t host=ntohl(ip->sin_addr.s_addr);
-   if((host>>24)==127)continue;unsigned prefix=u->OnLinkPrefixLength;if(prefix>32)continue;
-   uint32_t mask=prefix==0?0u:(0xffffffffu<<(32-prefix));
-   sockaddr_in target{};target.sin_family=AF_INET;target.sin_port=htons(47820);target.sin_addr.s_addr=htonl((host&mask)|(~mask));
-   const char msg[]="2PC_DISCOVER_V1";sendto(d,msg,(int)sizeof(msg)-1,0,(sockaddr*)&target,sizeof(target));
+   auto*ip=(sockaddr_in*)u->Address.lpSockaddr;
+   uint32_t host=ntohl(ip->sin_addr.s_addr);
+   if(host==0||(host>>24)==127||(host>>28)==14)continue;
+   unsigned prefix=u->OnLinkPrefixLength;
+   if(prefix>32)continue;
+   uint32_t mask=prefix==0?0u:(prefix==32?0xffffffffu:(0xffffffffu<<(32-prefix)));
+   uint32_t broadcast=(host&mask)|(~mask);
+   ScanTarget t{};t.local=ip->sin_addr;t.broadcast.s_addr=htonl(broadcast);
+   bool duplicate=false;for(const auto&x:targets)if(x.local.s_addr==t.local.s_addr)duplicate=true;
+   if(!duplicate)targets.push_back(t);
   }
  }
- auto until=std::chrono::steady_clock::now()+std::chrono::seconds(4);
- while(std::chrono::steady_clock::now()<until){
-  fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{0,300000};int ready=select(0,&set,nullptr,nullptr,&tv);
-  if(ready>0){char buf[64]{};sockaddr_in peer{};int len=sizeof(peer);int n=recvfrom(d,buf,sizeof(buf)-1,0,(sockaddr*)&peer,&len);
-   if(n>0&&std::string(buf,n)=="2PC1_V1 47821"){char ip[INET_ADDRSTRLEN]{};if(inet_ntop(AF_INET,&peer.sin_addr,ip,sizeof(ip))){found=ip;closesocket(d);return true;}}
+ if(targets.empty())return false;
+ const char msg[]="2PC_DISCOVER_V1";
+ for(const auto&t:targets){
+  SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET)continue;
+  BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_BROADCAST,(const char*)&yes,sizeof(yes));
+  sockaddr_in local{};local.sin_family=AF_INET;local.sin_addr=t.local;local.sin_port=0;
+  if(bind(d,(sockaddr*)&local,sizeof(local))==SOCKET_ERROR){closesocket(d);continue;}
+  sockaddr_in directed{};directed.sin_family=AF_INET;directed.sin_port=htons(47820);directed.sin_addr=t.broadcast;
+  sockaddr_in limited{};limited.sin_family=AF_INET;limited.sin_port=htons(47820);limited.sin_addr.s_addr=INADDR_BROADCAST;
+  if(t.broadcast.s_addr!=t.local.s_addr)sendto(d,msg,(int)sizeof(msg)-1,0,(sockaddr*)&directed,sizeof(directed));
+  sendto(d,msg,(int)sizeof(msg)-1,0,(sockaddr*)&limited,sizeof(limited));
+  auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(650);
+  while(std::chrono::steady_clock::now()<until){
+   fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{0,100000};
+   int ready=select(0,&set,nullptr,nullptr,&tv);
+   if(ready>0){
+    char buf[64]{};sockaddr_in peer{};int len=sizeof(peer);
+    int n=recvfrom(d,buf,sizeof(buf)-1,0,(sockaddr*)&peer,&len);
+    if(n>0&&std::string(buf,n)=="2PC1_V1 47821"){
+     char address[INET_ADDRSTRLEN]{};
+     if(inet_ntop(AF_INET,&peer.sin_addr,address,sizeof(address))){found=address;closesocket(d);return true;}
+    }
+   }else if(ready==SOCKET_ERROR)break;
   }
+  closesocket(d);
  }
- closesocket(d);return false;
+ return false;
 }
 static void Connect(){
  if(g_connected||g_connecting.exchange(true))return;
  g_stop=false;
  while(!g_stop&&!g_connected){
   wchar_t host[256]{};GetWindowTextW(g_ip,host,256);
+  bool autoMode=!host[0]||_wcsicmp(host,L"AUTO")==0;
   WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Ошибка Winsock. Повторяю попытку...");std::this_thread::sleep_for(std::chrono::seconds(2));continue;}
-  if(!host[0]||_wcsicmp(host,L"AUTO")==0){
-   std::string found;Ui(L"Ищу PC1 по прямому Ethernet-соединению...");
-   if(!DiscoverPC1(found)){WSACleanup();if(!g_stop){Ui(L"PC1 пока не найден. Автоматически повторяю поиск...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;}
-   MultiByteToWideChar(CP_UTF8,0,found.c_str(),-1,host,256);SetWindowTextW(g_ip,host);
+  if(autoMode){
+   std::string found;Ui(L"Автопоиск PC1 по всем активным сетевым интерфейсам...");
+   if(!DiscoverPC1(found)){
+    WSACleanup();if(!g_stop){Ui(L"PC1 не найден. Проверяю Ethernet снова через 2 секунды...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;
+   }
+   MultiByteToWideChar(CP_UTF8,0,found.c_str(),-1,host,256);
+   std::wstring discovered(host);
+   std::wstringstream message;message<<L"PC1 найден: "<<discovered<<L". Подключаюсь...";
+   Ui(message.str());Log(message.str());
   }
   char h[256]{};WideCharToMultiByte(CP_UTF8,0,host,-1,h,256,nullptr,nullptr);
-  addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
-  if(getaddrinfo(h,"47821",&hints,&res)!=0){WSACleanup();if(!g_stop){Ui(L"Не удалось определить адрес PC1. Повторяю поиск...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;}
+  addrinfo hints{};hints.ai_family=AF_INET;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
+  if(getaddrinfo(h,"47821",&hints,&res)!=0){
+   WSACleanup();if(!g_stop){Ui(autoMode?L"PC1 найден, повторяю автообнаружение...":L"Неверный IP PC1. Повторяю попытку...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;
+  }
   SOCKET sock=INVALID_SOCKET;
   for(auto*q=res;q;q=q->ai_next){
    sock=socket(q->ai_family,q->ai_socktype,q->ai_protocol);
@@ -279,10 +313,13 @@ static void Connect(){
    if(sock!=INVALID_SOCKET)closesocket(sock);sock=INVALID_SOCKET;
   }
   freeaddrinfo(res);
-  if(sock==INVALID_SOCKET){WSACleanup();if(!g_stop){Ui(L"PC1 найден, но TCP-соединение не установлено. Повторяю...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;}
+  if(sock==INVALID_SOCKET){
+   WSACleanup();if(!g_stop){Ui(autoMode?L"PC1 найден, но TCP недоступен. Повторно ищу его адрес...":L"PC1 найден, но TCP-соединение не установлено. Повторяю...");std::this_thread::sleep_for(std::chrono::seconds(2));}continue;
+  }
   ConfigureSocket(sock);g_socket=sock;g_connected=true;g_connecting=false;
-  Ui(L"Подключено напрямую по Ethernet. Автопереподключение включено.");
-  Log(L"Прямое Ethernet-соединение установлено.");std::thread(Worker,sock).detach();return;
+  Ui(L"Подключено к PC1 по Ethernet. Автопереподключение включено.");
+  Log(L"Соединение с PC1 установлено.");
+  std::thread(Worker,sock).detach();return;
  }
  g_connecting=false;
 }
