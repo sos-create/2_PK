@@ -152,6 +152,13 @@ static void RunDistributedTest(){
  if(remoteCpu>92.0||remoteMem>94.0)remoteShare=0.0;
  remoteShare=std::clamp(remoteShare,0.0,0.95);
  if(gameForeground&&remoteCpu<90.0&&remoteMem<92.0)remoteShare=1.0;
+ if(remoteShare<=0.001){
+  if(gameForeground){Ui(L"PC2 сейчас перегружен. Вычисление отложено, чтобы не мешать игре на PC1.");return;}
+  auto t0=std::chrono::steady_clock::now();uint64_t localOnly=CountPrimes(2,TEST_END);
+  auto dt=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count();
+  std::wstringstream msg;msg<<L"PC2 перегружен; задача выполнена локально: "<<localOnly<<L", время="<<dt<<L" мс.";
+  Ui(msg.str());Log(msg.str());return;
+ }
  uint64_t startN=2,span=TEST_END-startN+1;
  uint64_t remoteCount=(uint64_t)(span*remoteShare);
  uint64_t split=TEST_END-remoteCount;
