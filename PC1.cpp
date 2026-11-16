@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <tlhelp32.h>
+#include <shellapi.h>
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"d3d11.lib")
@@ -26,7 +27,7 @@ static constexpr uint64_t TEST_END=3000000;
 static constexpr UINT WM_APP_STATUS=WM_APP+1, WM_APP_LOG=WM_APP+2;
 static HWND g_status{},g_log{};
 static SOCKET g_client=INVALID_SOCKET,g_listener=INVALID_SOCKET;
-static std::mutex g_sockMutex;
+static std::mutex g_sockMutex,g_readMutex;
 static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
 static std::atomic<double> g_remoteCpu{45.0},g_remoteMem{0.0};
 static std::atomic<uint64_t> g_remoteRamMB{0},g_remoteVramMB{0},g_remoteSharedGpuMB{0};
@@ -236,13 +237,21 @@ static void DiscoveryLoop(){
  }
  closesocket(d);WSACleanup();
 }
+static bool EnsureFirewallRules(){
+ const wchar_t* args=L"/c netsh advfirewall firewall add rule name=\"2-PC PC1 TCP 47821\" dir=in action=allow protocol=TCP localport=47821 profile=any & netsh advfirewall firewall add rule name=\"2-PC PC1 UDP 47820\" dir=in action=allow protocol=UDP localport=47820 profile=any";
+ SHELLEXECUTEINFOW se{};se.cbSize=sizeof(se);se.fMask=SEE_MASK_NOCLOSEPROCESS;se.lpVerb=L"runas";se.lpFile=L"cmd.exe";se.lpParameters=args;se.nShow=SW_HIDE;
+ if(!ShellExecuteExW(&se))return false;
+ if(se.hProcess){WaitForSingleObject(se.hProcess,20000);DWORD code=1;GetExitCodeProcess(se.hProcess,&code);CloseHandle(se.hProcess);return code==0;}
+ return false;
+}
 static void ServerLoop(){
  WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Winsock не запустился");g_running=false;return;}
  SOCKET ls=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);if(ls==INVALID_SOCKET){Ui(L"Не удалось создать сокет");WSACleanup();g_running=false;return;}
  g_listener=ls;BOOL yes=TRUE;setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
  sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_port=htons(PORT);addr.sin_addr.s_addr=htonl(INADDR_ANY);
  if(bind(ls,(sockaddr*)&addr,sizeof(addr))==SOCKET_ERROR||listen(ls,1)==SOCKET_ERROR){Ui(L"Порт 47821 занят или заблокирован");closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;return;}
- Ui(L"Сервер запущен. Ожидаю PC2; включено автообнаружение по Ethernet.");
+ if(!EnsureFirewallRules())Log(L"Не удалось автоматически добавить правила брандмауэра. Разрешите запрос UAC или вручную разрешите TCP 47821 и UDP 47820 для PC1.");
+ Ui(L"Сервер запущен. Ожидаю PC2; автообнаружение по Ethernet включено.");
  std::thread discovery(DiscoveryLoop);
  while(g_running){
   SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}ConfigureSocket(c);
@@ -250,10 +259,13 @@ static void ServerLoop(){
   {std::lock_guard<std::mutex>lk(g_sockMutex);g_client=c;}
   g_connected=true;Ui(L"PC2 подключён напрямую по Ethernet");Log(L"PC2 подключён без парольной авторизации.");
   while(g_running&&g_connected){
-   if(g_taskActive){std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
-   fd_set set;FD_ZERO(&set);FD_SET(c,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
-   if(ready==SOCKET_ERROR)break;
-   if(ready>0){if(!ReadLine(c,line))break;std::istringstream in(line);std::string cmd;double cpu,mem;in>>cmd>>cpu>>mem;if(cmd=="HB"&&in){unsigned threads=0,gpus=0;uint64_t ram=0,vram=0,shared=0;in>>threads>>ram>>gpus>>vram>>shared;unsigned computeGpus=0;in>>computeGpus;g_remoteComputeGpuCount=computeGpus;g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);g_remoteThreads=threads;g_remoteRamMB=ram;g_remoteGpuCount=gpus;g_remoteVramMB=vram;g_remoteSharedGpuMB=shared;}}
+   {
+    std::lock_guard<std::mutex> readLock(g_readMutex);
+    if(g_taskActive){std::this_thread::sleep_for(std::chrono::milliseconds(50));continue;}
+    fd_set set;FD_ZERO(&set);FD_SET(c,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
+    if(ready==SOCKET_ERROR)break;
+    if(ready>0){if(!ReadLine(c,line))break;std::istringstream in(line);std::string cmd;double cpu=0,mem=0;in>>cmd>>cpu>>mem;if(cmd=="HB"&&in){unsigned threads=0,gpus=0;uint64_t ram=0,vram=0,shared=0;in>>threads>>ram>>gpus>>vram>>shared;unsigned computeGpus=0;in>>computeGpus;g_remoteComputeGpuCount=computeGpus;g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);g_remoteThreads=threads;g_remoteRamMB=ram;g_remoteGpuCount=gpus;g_remoteVramMB=vram;g_remoteSharedGpuMB=shared;}}
+   }
   }
   {std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client==c)g_client=INVALID_SOCKET;}
   closesocket(c);g_connected=false;Ui(L"PC2 отключён. Ожидаю повторное подключение.");Log(L"Соединение с PC2 закрыто.");
@@ -295,12 +307,12 @@ static void RunDistributedTest(){
  if(!SendAll(s,"TASK PRIME "+std::to_string(split+1)+" "+std::to_string(TEST_END)+"\n")){g_taskActive=false;Ui(L"Не удалось отправить задачу PC2");return;}
  uint64_t local=CountPrimes(startN,split);
  std::string answer;bool received=false;
- while(g_running&&g_connected){if(!ReadLine(s,answer))break;if(answer.rfind("HB ",0)==0){std::istringstream hb(answer);std::string tag;double cpu,mem;hb>>tag>>cpu>>mem;if(hb){unsigned threads=0,gpus=0;uint64_t ram=0,vram=0,shared=0;hb>>threads>>ram>>gpus>>vram>>shared;unsigned computeGpus=0;hb>>computeGpus;g_remoteComputeGpuCount=computeGpus;g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);g_remoteThreads=threads;g_remoteRamMB=ram;g_remoteGpuCount=gpus;g_remoteVramMB=vram;g_remoteSharedGpuMB=shared;}continue;}received=true;break;}
+ while(g_running&&g_connected){std::lock_guard<std::mutex> readLock(g_readMutex);if(!ReadLine(s,answer))break;if(answer.rfind("HB ",0)==0){std::istringstream hb(answer);std::string tag;double cpu,mem;hb>>tag>>cpu>>mem;if(hb){unsigned threads=0,gpus=0;uint64_t ram=0,vram=0,shared=0;hb>>threads>>ram>>gpus>>vram>>shared;unsigned computeGpus=0;hb>>computeGpus;g_remoteComputeGpuCount=computeGpus;g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);g_remoteThreads=threads;g_remoteRamMB=ram;g_remoteGpuCount=gpus;g_remoteVramMB=vram;g_remoteSharedGpuMB=shared;}continue;}received=true;break;}
  g_taskActive=false;
  if(!received||answer.rfind("RESULT ",0)!=0){Ui(L"PC2 не вернул результат. Проверьте соединение.");return;}
  uint64_t remote=0;try{remote=std::stoull(answer.substr(7));}catch(...){Ui(L"Некорректный ответ PC2");return;}
  auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
- auto localGpu=GetGpuInventory();std::wstringstream out;out<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%/"<<CpuThreads()<<L" потоков, PC2="<<(int)remoteCpu<<L"%/"<<g_remoteThreads.load()<<L" потоков, RAM доступно PC1="<<AvailableRamMB()<<L" МБ, PC2="<<g_remoteRamMB.load()<<L" МБ, GPU PC1="<<localGpu.count<<L" ("<<localGpu.dedicatedMB<<L" МБ VRAM), PC2="<<g_remoteGpuCount.load()<<L" ("<<g_remoteVramMB.load()<<L" МБ VRAM, D3D11 compute="<<g_remoteComputeGpuCount.load()<<L"), время="<<ms<<L" мс.";
+ auto localGpu=GetGpuInventory();std::wstringstream out;out<<((local+remote)==216816?L"ПРОВЕРКА ПРОЙДЕНА: ":L"ОШИБКА ПРОВЕРКИ: ")<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%/"<<CpuThreads()<<L" потоков, PC2="<<(int)remoteCpu<<L"%/"<<g_remoteThreads.load()<<L" потоков, RAM доступно PC1="<<AvailableRamMB()<<L" МБ, PC2="<<g_remoteRamMB.load()<<L" МБ, GPU PC1="<<localGpu.count<<L" ("<<localGpu.dedicatedMB<<L" МБ VRAM), PC2="<<g_remoteGpuCount.load()<<L" ("<<g_remoteVramMB.load()<<L" МБ VRAM, D3D11 compute="<<g_remoteComputeGpuCount.load()<<L"), время="<<ms<<L" мс.";
  Ui(out.str());Log(out.str());
 }
 static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
@@ -311,7 +323,7 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
   CreateWindowW(L"STATIC",L"PC1 — координатор и адаптивный планировщик",WS_CHILD|WS_VISIBLE,20,15,500,25,w,nullptr,nullptr,nullptr);
   CreateWindowW(L"BUTTON",L"Запустить сервер",WS_CHILD|WS_VISIBLE,20,55,140,32,w,(HMENU)1,nullptr,nullptr);
   CreateWindowW(L"BUTTON",L"Остановить",WS_CHILD|WS_VISIBLE,170,55,110,32,w,(HMENU)2,nullptr,nullptr);
-  CreateWindowW(L"BUTTON",L"Тест распределения",WS_CHILD|WS_VISIBLE,290,55,170,32,w,(HMENU)3,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Проверить распределение",WS_CHILD|WS_VISIBLE,290,55,170,32,w,(HMENU)3,nullptr,nullptr);
   g_status=CreateWindowW(L"STATIC",L"Сервер не запущен",WS_CHILD|WS_VISIBLE,20,102,540,35,w,nullptr,nullptr,nullptr);
   g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,145,540,245,w,nullptr,nullptr,nullptr);return 0;
  case WM_COMMAND:
