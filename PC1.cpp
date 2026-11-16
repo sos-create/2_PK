@@ -161,7 +161,7 @@ static bool CountPrimesGpu(uint64_t a,uint64_t b,uint64_t& result){
   DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(ad->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE))adapters.push_back(ad);else ad->Release();
  }
  f->Release();if(adapters.empty())return false;
- std::vector<uint64_t> sums(adapters.size(),0);std::vector<bool> ok(adapters.size(),false);std::vector<std::thread> jobs;
+ std::vector<uint64_t> sums(adapters.size(),0);std::vector<int> ok(adapters.size(),0);std::vector<std::thread> jobs;
  uint64_t length=b>=a?b-a+1:0,chunk=(length+adapters.size()-1)/adapters.size();
  for(size_t i=0;i<adapters.size();++i){
   uint64_t lo=a+(uint64_t)i*chunk;if(lo>b){adapters[i]->Release();continue;}
