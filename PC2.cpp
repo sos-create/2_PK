@@ -7,6 +7,9 @@
 #include <iphlpapi.h>
 #include <dxgi.h>
 #include <d3d11.h>
+#include <d3dcompiler.h>
+#include <cstring>
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -57,7 +60,7 @@ static GpuInventory GetGpuInventory(){
 static std::string MakeHeartbeat(){
  static const GpuInventory g=GetGpuInventory();std::ostringstream hb;hb<<"HB "<<CpuLoad()<<" "<<MemoryLoad()<<" "<<CpuThreads()<<" "<<AvailableRamMB()<<" "<<g.count<<" "<<g.dedicatedMB<<" "<<g.sharedMB<<" "<<g.computeCount<<"\n";return hb.str();
 }
-static uint64_t CountPrimes(uint64_t a,uint64_t b){
+static uint64_t CountPrimesCpuSingle(uint64_t a,uint64_t b){
  if(b<a||b<2)return 0;a=std::max<uint64_t>(a,2);
  uint64_t root=1;while(root+1<=b/(root+1))++root;
  std::vector<uint8_t> baseMark((size_t)root+1,1);std::vector<uint32_t> primes;
@@ -65,7 +68,7 @@ static uint64_t CountPrimes(uint64_t a,uint64_t b){
   primes.push_back((uint32_t)p);
   if(p<=root/p)for(uint64_t q=p*p;q<=root;q+=p)baseMark[(size_t)q]=0;
  }
- constexpr uint64_t BLOCK=1u<<20;uint64_t total=0;
+ constexpr uint64_t BLOCK=1u<<18;uint64_t total=0;
  for(uint64_t low=a;low<=b;){
   uint64_t high=std::min<uint64_t>(b,low+BLOCK-1);std::vector<uint8_t> mark((size_t)(high-low+1),1);
   for(uint64_t p:primes){
@@ -78,6 +81,91 @@ static uint64_t CountPrimes(uint64_t a,uint64_t b){
   if(high==b)break;low=high+1;
  }
  return total;
+}
+static uint64_t CountPrimesCpu(uint64_t a,uint64_t b){
+ if(b<a||b<2)return 0;
+ unsigned threads=std::max(1u,std::min( CpuThreads(), (unsigned)std::max<uint64_t>(1,(b-a+1)/(1u<<18))));
+ if(threads<=1)return CountPrimesCpuSingle(a,b);
+ std::vector<std::thread> pool;std::vector<uint64_t> sums(threads,0);
+ uint64_t length=b-a+1,chunk=(length+threads-1)/threads;
+ for(unsigned i=0;i<threads;++i){
+  uint64_t lo=a+(uint64_t)i*chunk;if(lo>b)break;
+  uint64_t hi=std::min<uint64_t>(b,lo+chunk-1);
+  pool.emplace_back([&,i,lo,hi]{sums[i]=CountPrimesCpuSingle(lo,hi);});
+ }
+ for(auto&t:pool)t.join();uint64_t total=0;for(auto v:sums)total+=v;return total;
+}
+static bool CountPrimesGpuOnAdapter(IDXGIAdapter1* adapter,uint64_t a,uint64_t b,uint64_t& result){
+ if(b<a)return false;
+ static const char* shader=R"(
+ RWByteAddressBuffer Counter : register(u0);
+ cbuffer Params : register(b0) { uint StartValue; uint ItemCount; uint Pad0; uint Pad1; };
+ [numthreads(256,1,1)]
+ void main(uint3 tid : SV_DispatchThreadID) {
+  uint i=tid.x;if(i>=ItemCount)return;
+  uint n=StartValue+i*2;
+  if(n==2){uint oldv;Counter.InterlockedAdd(0,1,oldv);return;}
+  if(n<2||(n&1)==0)return;
+  bool prime=true;
+  [loop] for(uint d=3;d<=n/d;d+=2){if(n%d==0){prime=false;break;}}
+  if(prime){uint oldv;Counter.InterlockedAdd(0,1,oldv);}
+ })";
+ ID3D11Device* dev=nullptr;ID3D11DeviceContext* ctx=nullptr;D3D_FEATURE_LEVEL fl{};
+ const D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
+ HRESULT hr=D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,levels,2,D3D11_SDK_VERSION,&dev,&fl,&ctx);
+ if(FAILED(hr)){const D3D_FEATURE_LEVEL fallback[]={D3D_FEATURE_LEVEL_11_0};hr=D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,fallback,1,D3D11_SDK_VERSION,&dev,&fl,&ctx);}
+ if(FAILED(hr)||!dev||!ctx){if(ctx)ctx->Release();if(dev)dev->Release();return false;}
+ ID3DBlob* bytecode=nullptr;ID3DBlob* errors=nullptr;
+ hr=D3DCompile(shader,strlen(shader),"2pc_prime_gpu",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&bytecode,&errors);
+ if(errors)errors->Release();if(FAILED(hr)||!bytecode){if(bytecode)bytecode->Release();ctx->Release();dev->Release();return false;}
+ ID3D11ComputeShader* cs=nullptr;hr=dev->CreateComputeShader(bytecode->GetBufferPointer(),bytecode->GetBufferSize(),nullptr,&cs);bytecode->Release();
+ if(FAILED(hr)){ctx->Release();dev->Release();return false;}
+ D3D11_BUFFER_DESC cbd{};cbd.ByteWidth=16;cbd.Usage=D3D11_USAGE_DEFAULT;cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+ ID3D11Buffer* cb=nullptr;hr=dev->CreateBuffer(&cbd,nullptr,&cb);
+ D3D11_BUFFER_DESC bd{};bd.ByteWidth=4;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS;
+ ID3D11Buffer* counter=nullptr;if(SUCCEEDED(hr))hr=dev->CreateBuffer(&bd,nullptr,&counter);
+ D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};ud.Format=DXGI_FORMAT_R32_TYPELESS;ud.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;ud.Buffer.FirstElement=0;ud.Buffer.NumElements=1;ud.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_RAW;
+ ID3D11UnorderedAccessView* uav=nullptr;if(SUCCEEDED(hr))hr=dev->CreateUnorderedAccessView(counter,&ud,&uav);
+ D3D11_BUFFER_DESC sd{};sd.ByteWidth=4;sd.Usage=D3D11_USAGE_STAGING;sd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+ ID3D11Buffer* staging=nullptr;if(SUCCEEDED(hr))hr=dev->CreateBuffer(&sd,nullptr,&staging);
+ if(FAILED(hr)){if(staging)staging->Release();if(uav)uav->Release();if(counter)counter->Release();if(cb)cb->Release();cs->Release();ctx->Release();dev->Release();return false;}
+ result=0;uint64_t first=a;if(first<3)first=3;if((first&1)==0)++first;
+ constexpr uint64_t CHUNK=32768;
+ if(a<=2&&b>=2)++result;
+ for(uint64_t low=first;low<=b;){
+  uint64_t count=std::min<uint64_t>(CHUNK,(b-low)/2+1);
+  UINT params[4]={(UINT)low,(UINT)count,0,0};ctx->UpdateSubresource(cb,0,nullptr,params,0,0);
+  UINT zero[4]={0,0,0,0};ctx->ClearUnorderedAccessViewUint(uav,zero);
+  ctx->CSSetShader(cs,nullptr,0);ctx->CSSetConstantBuffers(0,1,&cb);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
+  ctx->Dispatch((UINT)((count+255)/256),1,1);
+  ID3D11UnorderedAccessView* nullUav=nullptr;ctx->CSSetUnorderedAccessViews(0,1,&nullUav,nullptr);
+  ctx->CopyResource(staging,counter);D3D11_MAPPED_SUBRESOURCE mapped{};
+  hr=ctx->Map(staging,0,D3D11_MAP_READ,0,&mapped);if(FAILED(hr))break;
+  result+=*(const uint32_t*)mapped.pData;ctx->Unmap(staging,0);
+  uint64_t next=low+count*2;if(next<=low)break;low=next;
+ }
+ staging->Release();uav->Release();counter->Release();cb->Release();cs->Release();ctx->Release();dev->Release();
+ return SUCCEEDED(hr);
+}
+static bool CountPrimesGpu(uint64_t a,uint64_t b,uint64_t& result){
+ IDXGIFactory1* f=nullptr;if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return false;
+ bool ok=false;for(UINT i=0;;++i){IDXGIAdapter1* ad=nullptr;if(f->EnumAdapters1(i,&ad)==DXGI_ERROR_NOT_FOUND)break;
+  DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(ad->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){if(CountPrimesGpuOnAdapter(ad,a,b,result))ok=true;}
+  ad->Release();if(ok)break;
+ }f->Release();return ok;
+}
+static uint64_t CountPrimes(uint64_t a,uint64_t b){
+ if(b<a||b<2)return 0;
+ if(a<=2&&b>=2){if(a==2&&b==2)return 1;uint64_t mid=a+(b-a)/2; if(mid<2)mid=2;
+  uint64_t left=0,right=0;std::thread cpu([&]{left=CountPrimesCpu(a,mid);});
+  bool gpuOk=CountPrimesGpu(mid+1,b,right);cpu.join();
+  if(gpuOk)return left+right;
+  return CountPrimesCpu(a,b);
+ }
+ uint64_t mid=a+(b-a)/2,left=0,right=0;
+ std::thread cpu([&]{left=CountPrimesCpu(a,mid);});
+ bool gpuOk=CountPrimesGpu(mid+1,b,right);cpu.join();
+ return gpuOk?left+right:CountPrimesCpu(a,b);
 }
 static void Worker(SOCKET s){
  auto last=std::chrono::steady_clock::now();
