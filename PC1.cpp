@@ -1,106 +1,114 @@
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <string>
 #include <thread>
-#include <chrono>
 #include <mutex>
 #include <atomic>
 #include <sstream>
-#include <vector>
+#include <chrono>
 #include <cstdint>
+#include <algorithm>
+#pragma comment(lib,"ws2_32.lib")
 
-#pragma comment(lib, "ws2_32.lib")
-
-static constexpr int PORT = 47821;
-static HWND g_status{}, g_password{}, g_log{};
-static SOCKET g_client = INVALID_SOCKET, g_listener = INVALID_SOCKET;
+static constexpr unsigned short PORT=47821;
+static constexpr uint64_t TEST_END=3000000;
+static constexpr UINT WM_APP_STATUS=WM_APP+1, WM_APP_LOG=WM_APP+2;
+static HWND g_status{},g_password{},g_log{};
+static SOCKET g_client=INVALID_SOCKET,g_listener=INVALID_SOCKET;
 static std::mutex g_sockMutex;
-static std::atomic<bool> g_running{false}, g_connected{false};
-static std::wstring g_pass = L"change-me";
+static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
+static std::atomic<double> g_remoteCpu{45.0},g_remoteMem{0.0};
+static std::wstring g_pass=L"change-this-password";
 
-static void Ui(const wchar_t* s) { if (g_status) SetWindowTextW(g_status, s); }
-static bool SendAll(SOCKET s, const std::string& v) {
-    size_t p=0; while(p<v.size()){ int n=send(s,v.data()+p,(int)(v.size()-p),0); if(n<=0)return false; p+=(size_t)n;} return true;
+static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
+static void Log(const std::wstring&s){if(g_log)PostMessageW(GetParent(g_log),WM_APP_LOG,0,(LPARAM)new std::wstring(s));}
+static bool SendAll(SOCKET s,const std::string&v){size_t p=0;while(p<v.size()){int n=send(s,v.data()+p,(int)(v.size()-p),0);if(n<=0)return false;p+=(size_t)n;}return true;}
+static bool ReadLine(SOCKET s,std::string&out){out.clear();char c;while(out.size()<256){int n=recv(s,&c,1,0);if(n<=0)return false;if(c=='\n')return true;if(c!='\r')out+=c;}return false;}
+static double CpuLoad(){
+ static ULONGLONG oldIdle=0,oldKernel=0,oldUser=0; FILETIME i{},k{},u{};
+ if(!GetSystemTimes(&i,&k,&u))return 0;
+ auto cv=[](FILETIME f){ULARGE_INTEGER x{};x.LowPart=f.dwLowDateTime;x.HighPart=f.dwHighDateTime;return x.QuadPart;};
+ ULONGLONG ni=cv(i),nk=cv(k),nu=cv(u);double result=0;
+ if(oldKernel){ULONGLONG total=(nk-oldKernel)+(nu-oldUser),idle=ni-oldIdle;if(total)result=100.0*(double)(total-idle)/(double)total;}
+ oldIdle=ni;oldKernel=nk;oldUser=nu;return std::clamp(result,0.0,100.0);
 }
-static bool ReadLine(SOCKET s, std::string& out) {
-    out.clear(); char c;
-    while(out.size()<256){ int n=recv(s,&c,1,0); if(n<=0)return false; if(c=='\n')return true; if(c!='\r')out+=c; }
-    return false;
+static double MemoryLoad(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?(double)m.dwMemoryLoad:0.0;}
+static bool IsPrime(uint64_t n){if(n<2)return false;if(n%2==0)return n==2;for(uint64_t d=3;d<=n/d;d+=2)if(n%d==0)return false;return true;}
+static uint64_t CountPrimes(uint64_t a,uint64_t b){uint64_t c=0;for(uint64_t n=a;n<=b;++n)if(IsPrime(n))++c;return c;}
+static void ServerLoop(){
+ WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Winsock не запустился");g_running=false;return;}
+ SOCKET ls=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);if(ls==INVALID_SOCKET){Ui(L"Не удалось создать сокет");WSACleanup();g_running=false;return;}
+ g_listener=ls;BOOL yes=TRUE;setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
+ sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_port=htons(PORT);addr.sin_addr.s_addr=htonl(INADDR_ANY);
+ if(bind(ls,(sockaddr*)&addr,sizeof(addr))==SOCKET_ERROR||listen(ls,1)==SOCKET_ERROR){Ui(L"Порт 47821 занят или заблокирован");closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;return;}
+ Ui(L"Сервер запущен. Ожидаю PC2 на порту 47821.");
+ while(g_running){
+  SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}
+  std::string expected,line;int n=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
+  if(n>1){expected.resize(n);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),n,nullptr,nullptr);expected.resize(n-1);}
+  if(!ReadLine(c,line)||line!="HELLO "+expected||!SendAll(c,"OK\n")){closesocket(c);continue;}
+  {std::lock_guard<std::mutex>lk(g_sockMutex);g_client=c;}
+  g_connected=true;Ui(L"PC2 подключён и авторизован");Log(L"PC2 подключён.");
+  while(g_running&&g_connected){
+   if(g_taskActive){std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
+   fd_set set;FD_ZERO(&set);FD_SET(c,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
+   if(ready==SOCKET_ERROR)break;
+   if(ready>0){if(!ReadLine(c,line))break;std::istringstream in(line);std::string cmd;double cpu,mem;in>>cmd>>cpu>>mem;if(cmd=="HB"&&in){g_remoteCpu=std::clamp(cpu,0.0,100.0);g_remoteMem=std::clamp(mem,0.0,100.0);}}
+  }
+  {std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client==c)g_client=INVALID_SOCKET;}
+  closesocket(c);g_connected=false;Ui(L"PC2 отключён. Ожидаю повторное подключение.");Log(L"Соединение с PC2 закрыто.");
+ }
+ if(ls!=INVALID_SOCKET)closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;Ui(L"Сервер остановлен");
 }
-static bool IsPrime(uint64_t n) {
-    if(n<2)return false; if(n%2==0)return n==2;
-    for(uint64_t d=3;d<=n/d;d+=2)if(n%d==0)return false; return true;
-}
-static uint64_t CountPrimes(uint64_t a,uint64_t b) {
-    uint64_t count=0; for(uint64_t n=a;n<=b;++n)if(IsPrime(n))++count; return count;
-}
-static void Log(const std::wstring& s) {
-    if(!g_log)return; int len=GetWindowTextLengthW(g_log); SendMessageW(g_log,EM_SETSEL,len,len);
-    SendMessageW(g_log,EM_REPLACESEL,FALSE,(LPARAM)(s+L"\r\n").c_str());
-}
-static void ServerLoop() {
-    WSADATA wd{}; if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Ошибка запуска Winsock");return;}
-    SOCKET ls=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(ls==INVALID_SOCKET){Ui(L"Не удалось создать сокет");WSACleanup();return;}
-    g_listener=ls; BOOL yes=TRUE; setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,(char*)&yes,sizeof(yes));
-    sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(PORT); a.sin_addr.s_addr=htonl(INADDR_ANY);
-    if(bind(ls,(sockaddr*)&a,sizeof(a))==SOCKET_ERROR||listen(ls,1)==SOCKET_ERROR){Ui(L"Не удалось открыть порт 47821");closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();return;}
-    Ui(L"Ожидание PC2 на порту 47821...");
-    while(g_running){
-        SOCKET c=accept(ls,nullptr,nullptr); if(c==INVALID_SOCKET){if(!g_running)break;continue;}
-        std::string line; std::string expected;
-        int plen=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
-        if(plen>1){expected.resize(plen);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),plen,nullptr,nullptr);expected.resize(plen-1);}
-        if(!ReadLine(c,line)||line!="HELLO "+expected||!SendAll(c,"OK\n")){closesocket(c);continue;}
-        {std::lock_guard<std::mutex> lk(g_sockMutex); if(g_client!=INVALID_SOCKET)closesocket(g_client);g_client=c;}
-        g_connected=true; Ui(L"PC2 подключён — готов к вычислениям"); Log(L"PC2 прошёл авторизацию.");
-        while(g_running&&g_connected){
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            if(g_client!=c)break;
-        }
-        {std::lock_guard<std::mutex> lk(g_sockMutex);if(g_client==c)g_client=INVALID_SOCKET;}
-        closesocket(c);g_connected=false;Ui(L"PC2 отключён. Ожидание подключения...");
-    }
-    if(ls!=INVALID_SOCKET)closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();Ui(L"Сервер остановлен");
-}
-static void RunBenchmark() {
-    SOCKET s; {std::lock_guard<std::mutex> lk(g_sockMutex);s=g_client;}
-    if(!g_connected||s==INVALID_SOCKET){MessageBoxW(nullptr,L"Сначала подключите PC2.",L"Нет узла",MB_ICONWARNING);return;}
-    Ui(L"Выполняется распределённая задача...");
-    const uint64_t mid=1500000, end=3000000;
-    if(!SendAll(s,"TASK "+std::to_string(mid+1)+" "+std::to_string(end)+"\n")){Ui(L"Ошибка отправки задачи");return;}
-    auto start=GetTickCount64();
-    uint64_t local=CountPrimes(2,mid);
-    std::string answer;
-    if(!ReadLine(s,answer)||answer.rfind("RESULT ",0)!=0){Ui(L"PC2 не вернул корректный результат");return;}
-    uint64_t remote=0; try{remote=std::stoull(answer.substr(7));}catch(...){Ui(L"Ошибка формата результата");return;}
-    auto ms=GetTickCount64()-start;
-    std::wstringstream out;out<<L"Готово. PC1: "<<local<<L"; PC2: "<<remote<<L"; всего: "<<(local+remote)<<L"; время: "<<ms<<L" мс.";
-    Ui(out.str().c_str());Log(out.str());
+static void RunDistributedTest(){
+ SOCKET s;{std::lock_guard<std::mutex>lk(g_sockMutex);s=g_client;}
+ if(!g_connected||s==INVALID_SOCKET){MessageBoxW(nullptr,L"Сначала подключите PC2.",L"Нет вычислительного узла",MB_ICONWARNING);return;}
+ double localCpu=CpuLoad();double remoteCpu=g_remoteCpu.load();
+ double localFree=std::max(5.0,100.0-localCpu),remoteFree=std::max(5.0,100.0-remoteCpu);
+ double remoteShare=remoteFree/(localFree+remoteFree);
+ remoteShare=std::clamp(remoteShare,0.15,0.80);
+ uint64_t startN=2,span=TEST_END-startN+1;
+ uint64_t remoteCount=(uint64_t)(span*remoteShare);
+ uint64_t split=TEST_END-remoteCount;
+ if(split<startN)split=startN;
+ g_taskActive=true;Ui(L"Распределяю задачу по текущей загрузке CPU...");
+ auto started=std::chrono::steady_clock::now();
+ if(!SendAll(s,"TASK PRIME "+std::to_string(split+1)+" "+std::to_string(TEST_END)+"\n")){g_taskActive=false;Ui(L"Не удалось отправить задачу PC2");return;}
+ uint64_t local=CountPrimes(startN,split);
+ std::string answer;bool received=ReadLine(s,answer);g_taskActive=false;
+ if(!received||answer.rfind("RESULT ",0)!=0){Ui(L"PC2 не вернул результат. Проверьте соединение.");return;}
+ uint64_t remote=0;try{remote=std::stoull(answer.substr(7));}catch(...){Ui(L"Некорректный ответ PC2");return;}
+ auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
+ std::wstringstream out;out<<L"Тест завершён: PC1="<<local<<L", PC2="<<remote<<L", всего="<<(local+remote)<<L". Доля PC2="<<(int)(remoteShare*100)<<L"%, CPU PC1="<<(int)localCpu<<L"%, PC2="<<(int)remoteCpu<<L"%, RAM PC2="<<(int)g_remoteMem.load()<<L"%, время="<<ms<<L" мс.";
+ Ui(out.str());Log(out.str());
 }
 static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
-    switch(m){
-    case WM_CREATE:{
-        CreateWindowW(L"STATIC",L"PC1 — координатор вычислений",WS_CHILD|WS_VISIBLE,20,15,430,28,w,nullptr,nullptr,nullptr);
-        CreateWindowW(L"STATIC",L"Общий пароль:",WS_CHILD|WS_VISIBLE,20,55,100,22,w,nullptr,nullptr,nullptr);
-        g_password=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"change-me",WS_CHILD|WS_VISIBLE|ES_PASSWORD,125,52,180,25,w,(HMENU)10,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"Запустить сервер",WS_CHILD|WS_VISIBLE,20,92,140,32,w,(HMENU)1,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"Остановить",WS_CHILD|WS_VISIBLE,170,92,110,32,w,(HMENU)2,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"Тест распределения",WS_CHILD|WS_VISIBLE,290,92,160,32,w,(HMENU)3,nullptr,nullptr);
-        g_status=CreateWindowW(L"STATIC",L"Сервер не запущен",WS_CHILD|WS_VISIBLE,20,140,520,28,w,nullptr,nullptr,nullptr);
-        g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,175,520,190,w,nullptr,nullptr,nullptr);
-        return 0;}
-    case WM_COMMAND:
-        if(LOWORD(wp)==1&&!g_running){wchar_t b[256];GetWindowTextW(g_password,b,256);g_pass=b;g_running=true;std::thread(ServerLoop).detach();}
-        if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET)closesocket(g_listener);{std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}}g_connected=false;}
-        if(LOWORD(wp)==3)std::thread(RunBenchmark).detach();
-        return 0;
-    case WM_DESTROY:g_running=false;if(g_listener!=INVALID_SOCKET)closesocket(g_listener);{std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}}PostQuitMessage(0);return 0;
-    }return DefWindowProcW(w,m,wp,lp);
+ if(m==WM_APP_STATUS){auto*p=(std::wstring*)lp;SetWindowTextW(g_status,p->c_str());delete p;return 0;}
+ if(m==WM_APP_LOG){auto*p=(std::wstring*)lp;int n=GetWindowTextLengthW(g_log);SendMessageW(g_log,EM_SETSEL,n,n);SendMessageW(g_log,EM_REPLACESEL,FALSE,(LPARAM)(*p+L"\r\n").c_str());delete p;return 0;}
+ switch(m){
+ case WM_CREATE:
+  CreateWindowW(L"STATIC",L"PC1 — координатор и адаптивный планировщик",WS_CHILD|WS_VISIBLE,20,15,500,25,w,nullptr,nullptr,nullptr);
+  CreateWindowW(L"STATIC",L"Общий пароль:",WS_CHILD|WS_VISIBLE,20,53,100,22,w,nullptr,nullptr,nullptr);
+  g_password=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"change-this-password",WS_CHILD|WS_VISIBLE|ES_PASSWORD,125,50,220,25,w,(HMENU)10,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Запустить сервер",WS_CHILD|WS_VISIBLE,20,90,140,32,w,(HMENU)1,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Остановить",WS_CHILD|WS_VISIBLE,170,90,110,32,w,(HMENU)2,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Тест распределения",WS_CHILD|WS_VISIBLE,290,90,170,32,w,(HMENU)3,nullptr,nullptr);
+  g_status=CreateWindowW(L"STATIC",L"Сервер не запущен",WS_CHILD|WS_VISIBLE,20,137,540,35,w,nullptr,nullptr,nullptr);
+  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,180,540,210,w,nullptr,nullptr,nullptr);return 0;
+ case WM_COMMAND:
+  if(LOWORD(wp)==1&&!g_running){wchar_t b[256]{};GetWindowTextW(g_password,b,256);if(wcslen(b)<8){MessageBoxW(w,L"Пароль должен содержать не менее 8 символов.",L"Слабый пароль",MB_ICONWARNING);return 0;}g_pass=b;g_running=true;std::thread(ServerLoop).detach();}
+  if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}g_connected=false;}
+  if(LOWORD(wp)==3)std::thread(RunDistributedTest).detach();return 0;
+ case WM_DESTROY:
+  g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}
+  {std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}}
+  PostQuitMessage(0);return 0;
+ }return DefWindowProcW(w,m,wp,lp);
 }
-int WINAPI wWinMain(HINSTANCE h,HINSTANCE, PWSTR,int show){
-    WNDCLASSW wc{};wc.lpfnWndProc=WndProc;wc.hInstance=h;wc.lpszClassName=L"PC1Window";wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassW(&wc);
-    HWND w=CreateWindowW(wc.lpszClassName,L"2-PC — PC1 Coordinator",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,200,160,580,430,nullptr,nullptr,h,nullptr);
-    if(!w)return 1;ShowWindow(w,show);MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return 0;
+int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
+ WNDCLASSW wc{};wc.lpfnWndProc=WndProc;wc.hInstance=h;wc.lpszClassName=L"TwoPC_PC1";wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassW(&wc);
+ HWND w=CreateWindowW(wc.lpszClassName,L"2-PC — PC1",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,180,140,600,450,nullptr,nullptr,h,nullptr);
+ if(!w)return 1;ShowWindow(w,show);MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return 0;
 }
