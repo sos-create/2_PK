@@ -178,6 +178,7 @@ static uint64_t CountPrimes(uint64_t a,uint64_t b){
  bool gpuOk=CountPrimesGpu(mid+1,b,right);cpu.join();
  return gpuOk?left+right:CountPrimesCpu(a,b);
 }
+static void Connect();
 static void Worker(SOCKET s){
  auto last=std::chrono::steady_clock::now();
  while(!g_stop){
@@ -193,7 +194,7 @@ static void Worker(SOCKET s){
   if(!SendAll(s,"RESULT "+std::to_string(result)+"\n"))break;
   std::wstringstream msg;msg<<L"Задача выполнена: "<<a<<L"–"<<b<<L"; найдено "<<result<<L"; "<<elapsed<<L" мс.";Log(msg.str());Ui(L"Подключено. Ожидаю задачи.");
  }
- g_connected=false;g_socket=INVALID_SOCKET;closesocket(s);if(!g_stop)Ui(L"Связь потеряна. Переподключитесь.");WSACleanup();
+ g_connected=false;g_socket=INVALID_SOCKET;closesocket(s);WSACleanup();if(!g_stop){Ui(L"Связь потеряна. Автоматически переподключаюсь...");std::this_thread::sleep_for(std::chrono::seconds(1));std::thread(Connect).detach();}
 }
 static bool DiscoverPC1(std::string& found){
  SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET)return false;
