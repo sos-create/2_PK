@@ -172,18 +172,23 @@ static bool CountPrimesGpu(uint64_t a,uint64_t b,uint64_t& result){
  for(size_t i=0;i<adapters.size();++i){result+=sums[i];if(!ok[i])all=false;adapters[i]->Release();}
  return all;
 }
+static std::atomic<double> g_cpuRate{0.0},g_gpuRate{0.0};
 static uint64_t CountPrimes(uint64_t a,uint64_t b){
- if(b<a||b<2)return 0;
- if(a<=2&&b>=2){if(a==2&&b==2)return 1;uint64_t mid=a+(b-a)/2; if(mid<2)mid=2;
-  uint64_t left=0,right=0;std::thread cpu([&]{left=CountPrimesCpu(a,mid);});
-  bool gpuOk=CountPrimesGpu(mid+1,b,right);cpu.join();
-  if(gpuOk)return left+right;
-  return CountPrimesCpu(a,b);
- }
- uint64_t mid=a+(b-a)/2,left=0,right=0;
- std::thread cpu([&]{left=CountPrimesCpu(a,mid);});
- bool gpuOk=CountPrimesGpu(mid+1,b,right);cpu.join();
- return gpuOk?left+right:CountPrimesCpu(a,b);
+ if(b<a||b<2)return 0;if(b-a<1)return CountPrimesCpu(a,b);
+ uint64_t length=b-a+1;double cr=g_cpuRate.load(),gr=g_gpuRate.load();
+ double gpuShare=(cr>0.0&&gr>0.0)?gr/(cr+gr):0.5;
+ gpuShare=std::clamp(gpuShare,0.05,0.80);
+ uint64_t gpuLength=(uint64_t)(length*gpuShare);gpuLength=std::clamp<uint64_t>(gpuLength,1,length-1);
+ uint64_t split=b-gpuLength,left=0,right=0;double cpuMs=1.0,gpuMs=1.0;
+ auto cpuStart=std::chrono::steady_clock::now();
+ std::thread cpu([&]{left=CountPrimesCpu(a,split);cpuMs=std::max(0.1,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-cpuStart).count());});
+ auto gpuStart=std::chrono::steady_clock::now();bool gpuOk=CountPrimesGpu(split+1,b,right);
+ gpuMs=std::max(0.1,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-gpuStart).count());
+ cpu.join();if(!gpuOk)return CountPrimesCpu(a,b);
+ double newCpu=(double)(split-a+1)/cpuMs,newGpu=(double)gpuLength/gpuMs;
+ auto smooth=[](std::atomic<double>&rate,double value){double old=rate.load();rate.store(old>0.0?old*0.65+value*0.35:value);};
+ smooth(g_cpuRate,newCpu);smooth(g_gpuRate,newGpu);
+ return left+right;
 }
 static void Connect();
 static void Worker(SOCKET s){
