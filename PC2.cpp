@@ -122,7 +122,7 @@ static bool CountPrimesGpuOnAdapter(IDXGIAdapter1* adapter,uint64_t a,uint64_t b
  if(FAILED(hr)){ctx->Release();dev->Release();return false;}
  D3D11_BUFFER_DESC cbd{};cbd.ByteWidth=16;cbd.Usage=D3D11_USAGE_DEFAULT;cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
  ID3D11Buffer* cb=nullptr;hr=dev->CreateBuffer(&cbd,nullptr,&cb);
- D3D11_BUFFER_DESC bd{};bd.ByteWidth=4;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS;
+ D3D11_BUFFER_DESC bd{};bd.ByteWidth=4;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS;bd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
  ID3D11Buffer* counter=nullptr;if(SUCCEEDED(hr))hr=dev->CreateBuffer(&bd,nullptr,&counter);
  D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};ud.Format=DXGI_FORMAT_R32_TYPELESS;ud.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;ud.Buffer.FirstElement=0;ud.Buffer.NumElements=1;ud.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_RAW;
  ID3D11UnorderedAccessView* uav=nullptr;if(SUCCEEDED(hr))hr=dev->CreateUnorderedAccessView(counter,&ud,&uav);
@@ -149,10 +149,21 @@ static bool CountPrimesGpuOnAdapter(IDXGIAdapter1* adapter,uint64_t a,uint64_t b
 }
 static bool CountPrimesGpu(uint64_t a,uint64_t b,uint64_t& result){
  IDXGIFactory1* f=nullptr;if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return false;
- bool ok=false;for(UINT i=0;;++i){IDXGIAdapter1* ad=nullptr;if(f->EnumAdapters1(i,&ad)==DXGI_ERROR_NOT_FOUND)break;
-  DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(ad->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){if(CountPrimesGpuOnAdapter(ad,a,b,result))ok=true;}
-  ad->Release();if(ok)break;
- }f->Release();return ok;
+ std::vector<IDXGIAdapter1*> adapters;
+ for(UINT i=0;;++i){IDXGIAdapter1* ad=nullptr;if(f->EnumAdapters1(i,&ad)==DXGI_ERROR_NOT_FOUND)break;
+  DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(ad->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE))adapters.push_back(ad);else ad->Release();
+ }
+ f->Release();if(adapters.empty())return false;
+ std::vector<uint64_t> sums(adapters.size(),0);std::vector<bool> ok(adapters.size(),false);std::vector<std::thread> jobs;
+ uint64_t length=b>=a?b-a+1:0,chunk=(length+adapters.size()-1)/adapters.size();
+ for(size_t i=0;i<adapters.size();++i){
+  uint64_t lo=a+(uint64_t)i*chunk;if(lo>b){adapters[i]->Release();continue;}
+  uint64_t hi=std::min<uint64_t>(b,lo+chunk-1);
+  jobs.emplace_back([&,i,lo,hi]{ok[i]=CountPrimesGpuOnAdapter(adapters[i],lo,hi,sums[i]);});
+ }
+ for(auto&t:jobs)t.join();result=0;bool all=true;
+ for(size_t i=0;i<adapters.size();++i){result+=sums[i];if(!ok[i])all=false;adapters[i]->Release();}
+ return all;
 }
 static uint64_t CountPrimes(uint64_t a,uint64_t b){
  if(b<a||b<2)return 0;
