@@ -23,6 +23,9 @@
 
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
 static HWND g_ip{},g_status{},g_log{};
+static HFONT g_uiFont=nullptr;
+static BOOL CALLBACK ApplyChildFont(HWND child,LPARAM font){SendMessageW(child,WM_SETFONT,(WPARAM)font,TRUE);return TRUE;}
+
 static SOCKET g_socket=INVALID_SOCKET;
 static std::atomic<bool> g_connected{false},g_stop{false},g_connecting{false};
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
@@ -295,13 +298,13 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
   CreateWindowW(L"BUTTON",L"Подключиться",WS_CHILD|WS_VISIBLE,20,88,140,32,w,(HMENU)1,nullptr,nullptr);
   CreateWindowW(L"BUTTON",L"Отключиться",WS_CHILD|WS_VISIBLE,170,88,140,32,w,(HMENU)2,nullptr,nullptr);
   g_status=CreateWindowW(L"STATIC",L"Не подключено",WS_CHILD|WS_VISIBLE,20,133,540,35,w,nullptr,nullptr,nullptr);
-  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,175,540,215,w,nullptr,nullptr,nullptr);return 0;
+  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,175,540,215,w,nullptr,nullptr,nullptr);g_uiFont=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");if(g_uiFont)EnumChildWindows(w,ApplyChildFont,(LPARAM)g_uiFont);return 0;
  case WM_COMMAND:if(LOWORD(wp)==1)std::thread(Connect).detach();if(LOWORD(wp)==2)Disconnect();return 0;
- case WM_DESTROY:Disconnect();PostQuitMessage(0);return 0;
+ case WM_DESTROY:Disconnect();if(g_uiFont){DeleteObject(g_uiFont);g_uiFont=nullptr;}PostQuitMessage(0);return 0;
  }return DefWindowProcW(w,m,wp,lp);
 }
 int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
  WNDCLASSW wc{};wc.lpfnWndProc=WndProc;wc.hInstance=h;wc.lpszClassName=L"TwoPC_PC2";wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassW(&wc);
- HWND w=CreateWindowW(wc.lpszClassName,L"2-PC — PC2",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,200,160,600,450,nullptr,nullptr,h,nullptr);
+ HWND w=CreateWindowW(wc.lpszClassName,L"2-PC — PC2 (русский интерфейс)",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,200,160,600,450,nullptr,nullptr,h,nullptr);
  if(!w)return 1;ShowWindow(w,show);MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return 0;
 }
