@@ -20,7 +20,7 @@ jobs:
         run: Move-Item PC1.exe PC1-Windows-x64.exe
       - name: Build PC2
         shell: cmd
-        run: cl /nologo /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN PC2.cpp /link /SUBSYSTEM:WINDOWS ws2_32.lib user32.lib gdi32.lib
+        run: cl /nologo /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN PC2.cpp /link /SUBSYSTEM:WINDOWS ws2_32.lib iphlpapi.lib user32.lib gdi32.lib
       - name: Rename PC2 executable
         shell: pwsh
         run: Move-Item PC2.exe PC2-Windows-x64.exe
