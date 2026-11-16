@@ -5,6 +5,7 @@
 #include <vector>
 #include <windows.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <cstdint>
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"bcrypt.lib")
+#pragma comment(lib,"iphlpapi.lib")
 
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
 static HWND g_ip{},g_pass{},g_status{},g_log{};
@@ -88,10 +90,41 @@ static void Worker(SOCKET s){
  }
  g_connected=false;g_socket=INVALID_SOCKET;closesocket(s);if(!g_stop)Ui(L"Связь потеряна. Переподключитесь.");WSACleanup();
 }
+static bool DiscoverPC1(std::string& found){
+ SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET)return false;
+ BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_BROADCAST,(const char*)&yes,sizeof(yes));
+ DWORD bytes=15000;std::vector<unsigned char> storage(bytes);
+ IP_ADAPTER_ADDRESSES* first=(IP_ADAPTER_ADDRESSES*)storage.data();
+ ULONG rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);
+ if(rc==ERROR_BUFFER_OVERFLOW){storage.resize(bytes);first=(IP_ADAPTER_ADDRESSES*)storage.data();rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);}
+ if(rc==NO_ERROR)for(auto*ad=first;ad;ad=ad->Next){
+  if(ad->OperStatus!=IfOperStatusUp)continue;
+  for(auto*u=ad->FirstUnicastAddress;u;u=u->Next){
+   if(!u->Address.lpSockaddr||u->Address.lpSockaddr->sa_family!=AF_INET)continue;
+   auto*ip=(sockaddr_in*)u->Address.lpSockaddr;uint32_t host=ntohl(ip->sin_addr.s_addr);
+   if((host>>24)==127)continue;unsigned prefix=u->OnLinkPrefixLength;if(prefix>32)continue;
+   uint32_t mask=prefix==0?0u:(0xffffffffu<<(32-prefix));
+   sockaddr_in target{};target.sin_family=AF_INET;target.sin_port=htons(47820);target.sin_addr.s_addr=htonl((host&mask)|(~mask));
+   const char msg[]="2PC_DISCOVER_V1";sendto(d,msg,(int)sizeof(msg)-1,0,(sockaddr*)&target,sizeof(target));
+  }
+ }
+ auto until=std::chrono::steady_clock::now()+std::chrono::seconds(4);
+ while(std::chrono::steady_clock::now()<until){
+  fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{0,300000};int ready=select(0,&set,nullptr,nullptr,&tv);
+  if(ready>0){char buf[64]{};sockaddr_in peer{};int len=sizeof(peer);int n=recvfrom(d,buf,sizeof(buf)-1,0,(sockaddr*)&peer,&len);
+   if(n>0&&std::string(buf,n)=="2PC1_V1 47821"){char ip[INET_ADDRSTRLEN]{};if(inet_ntop(AF_INET,&peer.sin_addr,ip,sizeof(ip))){found=ip;closesocket(d);return true;}}
+  }
+ }
+ closesocket(d);return false;
+}
 static void Connect(){
  if(g_connected)return;wchar_t host[256]{},pw[256]{};GetWindowTextW(g_ip,host,256);GetWindowTextW(g_pass,pw,256);
- if(!host[0]||wcslen(pw)<8){Ui(L"Введите IP и пароль не короче 8 символов");return;}
+ if(wcslen(pw)<8){Ui(L"Введите пароль не короче 8 символов");return;}
  WSADATA wd{};if(WSAStartup(MAKEWORD(2,2),&wd)!=0){Ui(L"Ошибка Winsock");return;}
+ if(!host[0]||_wcsicmp(host,L"AUTO")==0){std::string found;Ui(L"Автоматически ищу PC1 по Ethernet...");
+  if(!DiscoverPC1(found)){WSACleanup();Ui(L"PC1 не найден. Проверьте кабель и запущенный сервер.");return;}
+  MultiByteToWideChar(CP_UTF8,0,found.c_str(),-1,host,256);SetWindowTextW(g_ip,host);
+ }
  char h[256]{},p[256]{};WideCharToMultiByte(CP_UTF8,0,host,-1,h,256,nullptr,nullptr);WideCharToMultiByte(CP_UTF8,0,pw,-1,p,256,nullptr,nullptr);
  addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;addrinfo*res=nullptr;
  if(getaddrinfo(h,"47821",&hints,&res)!=0){Ui(L"Неверный IP");WSACleanup();return;}
@@ -108,8 +141,8 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
  switch(m){
  case WM_CREATE:
   CreateWindowW(L"STATIC",L"PC2 — адаптивный вычислительный узел",WS_CHILD|WS_VISIBLE,20,15,500,25,w,nullptr,nullptr,nullptr);
-  CreateWindowW(L"STATIC",L"IP компьютера PC1:",WS_CHILD|WS_VISIBLE,20,53,130,22,w,nullptr,nullptr,nullptr);
-  g_ip=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"192.168.1.100",WS_CHILD|WS_VISIBLE,155,50,200,25,w,(HMENU)10,nullptr,nullptr);
+  CreateWindowW(L"STATIC",L"IP PC1 (AUTO — поиск по Ethernet):",WS_CHILD|WS_VISIBLE,20,53,130,22,w,nullptr,nullptr,nullptr);
+  g_ip=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"AUTO",WS_CHILD|WS_VISIBLE,155,50,200,25,w,(HMENU)10,nullptr,nullptr);
   CreateWindowW(L"STATIC",L"Общий пароль:",WS_CHILD|WS_VISIBLE,20,88,120,22,w,nullptr,nullptr,nullptr);
   g_pass=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"change-this-password",WS_CHILD|WS_VISIBLE|ES_PASSWORD,155,85,200,25,w,(HMENU)11,nullptr,nullptr);
   CreateWindowW(L"BUTTON",L"Подключиться",WS_CHILD|WS_VISIBLE,20,125,140,32,w,(HMENU)1,nullptr,nullptr);
