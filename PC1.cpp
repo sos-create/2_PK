@@ -21,11 +21,15 @@
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"d3d11.lib")
+#pragma comment(lib,"shell32.lib")
 
 static constexpr unsigned short PORT=47821;
 static constexpr uint64_t TEST_END=3000000;
 static constexpr UINT WM_APP_STATUS=WM_APP+1, WM_APP_LOG=WM_APP+2;
 static HWND g_status{},g_log{};
+static HFONT g_uiFont=nullptr;
+static BOOL CALLBACK ApplyChildFont(HWND child,LPARAM font){SendMessageW(child,WM_SETFONT,(WPARAM)font,TRUE);return TRUE;}
+
 static SOCKET g_client=INVALID_SOCKET,g_listener=INVALID_SOCKET;
 static std::mutex g_sockMutex,g_readMutex;
 static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
@@ -325,12 +329,13 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
   CreateWindowW(L"BUTTON",L"Остановить",WS_CHILD|WS_VISIBLE,170,55,110,32,w,(HMENU)2,nullptr,nullptr);
   CreateWindowW(L"BUTTON",L"Проверить распределение",WS_CHILD|WS_VISIBLE,290,55,170,32,w,(HMENU)3,nullptr,nullptr);
   g_status=CreateWindowW(L"STATIC",L"Сервер не запущен",WS_CHILD|WS_VISIBLE,20,102,540,35,w,nullptr,nullptr,nullptr);
-  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,145,540,245,w,nullptr,nullptr,nullptr);return 0;
+  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,145,540,245,w,nullptr,nullptr,nullptr);g_uiFont=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");if(g_uiFont)EnumChildWindows(w,ApplyChildFont,(LPARAM)g_uiFont);return 0;
  case WM_COMMAND:
   if(LOWORD(wp)==1&&!g_running){g_running=true;std::thread(ServerLoop).detach();}
   if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}g_connected=false;}
   if(LOWORD(wp)==3)std::thread(RunDistributedTest).detach();return 0;
  case WM_DESTROY:
+  if(g_uiFont){DeleteObject(g_uiFont);g_uiFont=nullptr;}
   g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}
   {std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}}
   PostQuitMessage(0);return 0;
@@ -338,6 +343,6 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
 }
 int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
  WNDCLASSW wc{};wc.lpfnWndProc=WndProc;wc.hInstance=h;wc.lpszClassName=L"TwoPC_PC1";wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassW(&wc);
- HWND w=CreateWindowW(wc.lpszClassName,L"2-PC — PC1",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,180,140,600,450,nullptr,nullptr,h,nullptr);
+ HWND w=CreateWindowW(wc.lpszClassName,L"2-PC — PC1 (русский интерфейс)",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,180,140,600,450,nullptr,nullptr,h,nullptr);
  if(!w)return 1;ShowWindow(w,show);MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return 0;
 }
