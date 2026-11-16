@@ -29,7 +29,7 @@ struct WorkerSession {
  std::mutex sendMutex,resultMutex; std::condition_variable resultCv;
  uint64_t result=0; bool resultReady=false;
 };
-static std::mutex g_workersMutex;
+static std::mutex g_workersMutex,g_testMutex;
 static std::vector<std::shared_ptr<WorkerSession>> g_workers;
 static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
 static std::atomic<int> g_handlerCount{0};
@@ -137,6 +137,7 @@ static void ServerLoop(){
  WSACleanup();g_running=false;Ui(L"Сервер остановлен");
 }
 static void RunDistributedTest(){
+ std::unique_lock<std::mutex> testLock(g_testMutex,std::try_to_lock);if(!testLock.owns_lock())return;
  std::vector<std::shared_ptr<WorkerSession>> nodes;
  {std::lock_guard<std::mutex>lk(g_workersMutex);nodes=g_workers;}
  nodes.erase(std::remove_if(nodes.begin(),nodes.end(),[](auto&n){return !n->alive;}),nodes.end());
@@ -185,7 +186,7 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
  case WM_COMMAND:
   if(LOWORD(wp)==1&&!g_running){wchar_t b[256]{};GetWindowTextW(g_password,b,256);if(wcslen(b)<8){MessageBoxW(w,L"Пароль должен содержать не менее 8 символов.",L"Слабый пароль",MB_ICONWARNING);return 0;}g_pass=b;g_running=true;std::thread(ServerLoop).detach();}
   if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET)shutdown(g_listener,SD_BOTH);{std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);}g_connected=false;}}
-  if(LOWORD(wp)==3){bool expected=false;if(g_taskActive.compare_exchange_strong(expected,true)){g_taskActive=false;std::thread(RunDistributedTest).detach();}else MessageBoxW(w,L"Задача уже выполняется.",L"Занято",MB_ICONINFORMATION);}return 0;
+  if(LOWORD(wp)==3)std::thread(RunDistributedTest).detach();return 0;
  case WM_DESTROY:
   g_running=false;if(g_listener!=INVALID_SOCKET)shutdown(g_listener,SD_BOTH);
   {std::lock_guard<std::mutex>lk(g_workersMutex);for(auto&n:g_workers){n->alive=false;shutdown(n->socket,SD_BOTH);}g_connected=false;}
