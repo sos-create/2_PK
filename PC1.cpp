@@ -1,6 +1,8 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <bcrypt.h>
+#include <vector>
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <string>
@@ -12,6 +14,7 @@
 #include <cstdint>
 #include <algorithm>
 #pragma comment(lib,"ws2_32.lib")
+#pragma comment(lib,"bcrypt.lib")
 
 static constexpr unsigned short PORT=47821;
 static constexpr uint64_t TEST_END=3000000;
@@ -25,6 +28,20 @@ static std::wstring g_pass=L"change-this-password";
 
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
 static void Log(const std::wstring&s){if(g_log)PostMessageW(GetParent(g_log),WM_APP_LOG,0,(LPARAM)new std::wstring(s));}
+
+static std::string Hex(const std::vector<UCHAR>& v){static const char*d="0123456789abcdef";std::string o;o.reserve(v.size()*2);for(UCHAR c:v){o+=d[c>>4];o+=d[c&15];}return o;}
+static bool Unhex(const std::string&s,std::vector<UCHAR>&o){if(s.size()%2||s.size()>128)return false;o.clear();for(size_t i=0;i<s.size();i+=2){auto cv=[](char c)->int{if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;};int x=cv(s[i]),y=cv(s[i+1]);if(x<0||y<0)return false;o.push_back((UCHAR)((x<<4)|y));}return true;}
+static bool HmacSha256(const std::string&key,const std::vector<UCHAR>&data,std::vector<UCHAR>&out){
+ BCRYPT_ALG_HANDLE alg=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;DWORD objLen=0,cb=0;std::vector<UCHAR>obj(1024);out.assign(32,0);
+ if(BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,nullptr,BCRYPT_ALG_HANDLE_HMAC_FLAG)<0)return false;
+ bool ok=BCryptGetProperty(alg,BCRYPT_OBJECT_LENGTH,(PUCHAR)&objLen,sizeof(objLen),&cb,0)>=0;
+ if(ok){obj.resize(objLen);ok=BCryptCreateHash(alg,&hash,obj.data(),objLen,(PUCHAR)key.data(),(ULONG)key.size(),0)>=0;}
+ if(ok)ok=BCryptHashData(hash,(PUCHAR)data.data(),(ULONG)data.size(),0)>=0;
+ if(ok)ok=BCryptFinishHash(hash,out.data(),(ULONG)out.size(),0)>=0;
+ if(hash)BCryptDestroyHash(hash);BCryptCloseAlgorithmProvider(alg,0);return ok;
+}
+static bool MakeProof(const std::string&key,const std::string&nonceHex,std::string&proof){std::vector<UCHAR>nonce,mac;if(!Unhex(nonceHex,nonce)||nonce.size()!=32||!HmacSha256(key,nonce,mac))return false;proof=Hex(mac);return true;}
+
 static bool SendAll(SOCKET s,const std::string&v){size_t p=0;while(p<v.size()){int n=send(s,v.data()+p,(int)(v.size()-p),0);if(n<=0)return false;p+=(size_t)n;}return true;}
 static bool ReadLine(SOCKET s,std::string&out){out.clear();char c;while(out.size()<256){int n=recv(s,&c,1,0);if(n<=0)return false;if(c=='\n')return true;if(c!='\r')out+=c;}return false;}
 static double CpuLoad(){
@@ -49,7 +66,11 @@ static void ServerLoop(){
   SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}
   std::string expected,line;int n=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
   if(n>1){expected.resize(n);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),n,nullptr,nullptr);expected.resize(n-1);}
-  if(!ReadLine(c,line)||line!="HELLO "+expected||!SendAll(c,"OK\n")){closesocket(c);continue;}
+  std::vector<UCHAR> nonce(32);if(BCryptGenRandom(nullptr,nonce.data(),(ULONG)nonce.size(),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0){closesocket(c);continue;}
+  if(!SendAll(c,"CHALLENGE "+Hex(nonce)+"\n")||!ReadLine(c,line)||line.rfind("AUTH ",0)!=0){closesocket(c);continue;}
+  std::string proof;if(!MakeProof(expected,Hex(nonce),proof)||line.size()!=5+proof.size()){closesocket(c);continue;}
+  unsigned diff=0;for(size_t i=0;i<proof.size();++i)diff|=(unsigned char)proof[i]^(unsigned char)line[i+5];
+  if(diff!=0||!SendAll(c,"OK\n")){closesocket(c);continue;}
   {std::lock_guard<std::mutex>lk(g_sockMutex);g_client=c;}
   g_connected=true;Ui(L"PC2 подключён и авторизован");Log(L"PC2 подключён.");
   while(g_running&&g_connected){
