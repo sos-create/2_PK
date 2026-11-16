@@ -1,0 +1,33 @@
+name: Build Windows apps
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Build PC1
+        shell: cmd
+        run: cl /nologo /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN PC1.cpp /link /SUBSYSTEM:WINDOWS ws2_32.lib user32.lib gdi32.lib
+      - name: Rename PC1 executable
+        shell: pwsh
+        run: Move-Item PC1.exe PC1-Windows-x64.exe
+      - name: Build PC2
+        shell: cmd
+        run: cl /nologo /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN PC2.cpp /link /SUBSYSTEM:WINDOWS ws2_32.lib user32.lib gdi32.lib
+      - name: Rename PC2 executable
+        shell: pwsh
+        run: Move-Item PC2.exe PC2-Windows-x64.exe
+      - name: Upload applications
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2-PC-Windows-x64
+          path: |
+            PC1-Windows-x64.exe
+            PC2-Windows-x64.exe
