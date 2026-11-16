@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <dxgi.h>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -15,6 +16,7 @@
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"bcrypt.lib")
 #pragma comment(lib,"iphlpapi.lib")
+#pragma comment(lib,"dxgi.lib")
 
 static constexpr UINT WM_APP_STATUS=WM_APP+1,WM_APP_LOG=WM_APP+2;
 static HWND g_ip{},g_pass{},g_status{},g_log{};
@@ -51,6 +53,21 @@ static double CpuLoad(){
  ULONGLONG ni=cv(i),nk=cv(k),nu=cv(u);double v=0;if(ok){ULONGLONG total=(nk-ok)+(nu-ou),idle=ni-oi;if(total)v=100.0*(double)(total-idle)/(double)total;}oi=ni;ok=nk;ou=nu;return v;
 }
 static double MemoryLoad(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?(double)m.dwMemoryLoad:0;}
+static uint64_t AvailableRamMB(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?m.ullAvailPhys/(1024ull*1024ull):0;}
+static unsigned CpuThreads(){return GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);}
+struct GpuInventory{unsigned count=0;uint64_t dedicatedMB=0,sharedMB=0;};
+static GpuInventory GetGpuInventory(){
+ GpuInventory out;IDXGIFactory1*f=nullptr;
+ if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&f)))return out;
+ for(UINT i=0;;++i){IDXGIAdapter1*a=nullptr;if(f->EnumAdapters1(i,&a)==DXGI_ERROR_NOT_FOUND)break;
+  DXGI_ADAPTER_DESC1 d{};if(SUCCEEDED(a->GetDesc1(&d))&&!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){
+   ++out.count;out.dedicatedMB+=d.DedicatedVideoMemory/(1024ull*1024ull);out.sharedMB+=d.SharedSystemMemory/(1024ull*1024ull);
+  }a->Release();
+ }f->Release();return out;
+}
+static std::string MakeHeartbeat(){
+ auto g=GetGpuInventory();std::ostringstream hb;hb<<"HB "<<CpuLoad()<<" "<<MemoryLoad()<<" "<<CpuThreads()<<" "<<AvailableRamMB()<<" "<<g.count<<" "<<g.dedicatedMB<<" "<<g.sharedMB<<"\n";return hb.str();
+}
 static uint64_t CountPrimes(uint64_t a,uint64_t b){
  if(b<a||b<2)return 0;a=std::max<uint64_t>(a,2);
  uint64_t root=1;while(root+1<=b/(root+1))++root;
@@ -78,7 +95,7 @@ static void Worker(SOCKET s){
  while(!g_stop){
   fd_set set;FD_ZERO(&set);FD_SET(s,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
   if(ready==SOCKET_ERROR)break;
-  if(ready==0){double cpu=CpuLoad(),mem=MemoryLoad();std::ostringstream hb;hb<<"HB "<<cpu<<" "<<mem<<"\n";if(!SendAll(s,hb.str()))break;continue;}
+  if(ready==0){if(!SendAll(s,MakeHeartbeat()))break;continue;}
   std::string line;if(!ReadLine(s,line))break;
   std::istringstream in(line);std::string cmd,kind;uint64_t a=0,b=0;in>>cmd>>kind>>a>>b;
   if(cmd!="TASK"||kind!="PRIME"||!in||a<2||b<a||b>50000000){if(!SendAll(s,"ERROR\n"))break;continue;}
