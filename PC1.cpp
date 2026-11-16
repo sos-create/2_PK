@@ -4,6 +4,7 @@
 #include <ws2tcpip.h>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <mutex>
 #include <atomic>
 #include <sstream>
@@ -50,7 +51,7 @@ static void ServerLoop() {
         SOCKET c=accept(ls,nullptr,nullptr); if(c==INVALID_SOCKET){if(!g_running)break;continue;}
         std::string line; std::string expected;
         int plen=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
-        if(plen>1){expected.resize(plen-1);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),plen,nullptr,nullptr);}
+        if(plen>1){expected.resize(plen);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),plen,nullptr,nullptr);expected.resize(plen-1);}
         if(!ReadLine(c,line)||line!="HELLO "+expected||!SendAll(c,"OK\n")){closesocket(c);continue;}
         {std::lock_guard<std::mutex> lk(g_sockMutex); if(g_client!=INVALID_SOCKET)closesocket(g_client);g_client=c;}
         g_connected=true; Ui(L"PC2 подключён — готов к вычислениям"); Log(L"PC2 прошёл авторизацию.");
@@ -68,7 +69,7 @@ static void RunBenchmark() {
     if(!g_connected||s==INVALID_SOCKET){MessageBoxW(nullptr,L"Сначала подключите PC2.",L"Нет узла",MB_ICONWARNING);return;}
     Ui(L"Выполняется распределённая задача...");
     const uint64_t mid=1500000, end=3000000;
-    if(!SendAll(s,"TASK 2 "+std::to_string(mid+1)+" "+std::to_string(end)+"\n")){Ui(L"Ошибка отправки задачи");return;}
+    if(!SendAll(s,"TASK "+std::to_string(mid+1)+" "+std::to_string(end)+"\n")){Ui(L"Ошибка отправки задачи");return;}
     auto start=GetTickCount64();
     uint64_t local=CountPrimes(2,mid);
     std::string answer;
