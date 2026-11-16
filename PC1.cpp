@@ -1,7 +1,6 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
-#include <bcrypt.h>
 #include <vector>
 #include <windows.h>
 #include <ws2tcpip.h>
@@ -15,38 +14,24 @@
 #include <chrono>
 #include <cstdint>
 #include <algorithm>
+#include <tlhelp32.h>
 #pragma comment(lib,"ws2_32.lib")
-#pragma comment(lib,"bcrypt.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"d3d11.lib")
 
 static constexpr unsigned short PORT=47821;
 static constexpr uint64_t TEST_END=3000000;
 static constexpr UINT WM_APP_STATUS=WM_APP+1, WM_APP_LOG=WM_APP+2;
-static HWND g_status{},g_password{},g_log{};
+static HWND g_status{},g_log{};
 static SOCKET g_client=INVALID_SOCKET,g_listener=INVALID_SOCKET;
 static std::mutex g_sockMutex;
 static std::atomic<bool> g_running{false},g_connected{false},g_taskActive{false};
 static std::atomic<double> g_remoteCpu{45.0},g_remoteMem{0.0};
 static std::atomic<uint64_t> g_remoteRamMB{0},g_remoteVramMB{0},g_remoteSharedGpuMB{0};
 static std::atomic<unsigned> g_remoteThreads{0},g_remoteGpuCount{0},g_remoteComputeGpuCount{0};
-static std::wstring g_pass=L"change-this-password";
 
 static void Ui(const std::wstring&s){if(g_status)PostMessageW(GetParent(g_status),WM_APP_STATUS,0,(LPARAM)new std::wstring(s));}
 static void Log(const std::wstring&s){if(g_log)PostMessageW(GetParent(g_log),WM_APP_LOG,0,(LPARAM)new std::wstring(s));}
-
-static std::string Hex(const std::vector<UCHAR>& v){static const char*d="0123456789abcdef";std::string o;o.reserve(v.size()*2);for(UCHAR c:v){o+=d[c>>4];o+=d[c&15];}return o;}
-static bool Unhex(const std::string&s,std::vector<UCHAR>&o){if(s.size()%2||s.size()>128)return false;o.clear();for(size_t i=0;i<s.size();i+=2){auto cv=[](char c)->int{if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;};int x=cv(s[i]),y=cv(s[i+1]);if(x<0||y<0)return false;o.push_back((UCHAR)((x<<4)|y));}return true;}
-static bool HmacSha256(const std::string&key,const std::vector<UCHAR>&data,std::vector<UCHAR>&out){
- BCRYPT_ALG_HANDLE alg=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;DWORD objLen=0,cb=0;std::vector<UCHAR>obj(1024);out.assign(32,0);
- if(BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,nullptr,BCRYPT_ALG_HANDLE_HMAC_FLAG)<0)return false;
- bool ok=BCryptGetProperty(alg,BCRYPT_OBJECT_LENGTH,(PUCHAR)&objLen,sizeof(objLen),&cb,0)>=0;
- if(ok){obj.resize(objLen);ok=BCryptCreateHash(alg,&hash,obj.data(),objLen,(PUCHAR)key.data(),(ULONG)key.size(),0)>=0;}
- if(ok)ok=BCryptHashData(hash,(PUCHAR)data.data(),(ULONG)data.size(),0)>=0;
- if(ok)ok=BCryptFinishHash(hash,out.data(),(ULONG)out.size(),0)>=0;
- if(hash)BCryptDestroyHash(hash);BCryptCloseAlgorithmProvider(alg,0);return ok;
-}
-static bool MakeProof(const std::string&key,const std::string&nonceHex,std::string&proof){std::vector<UCHAR>nonce,mac;if(!Unhex(nonceHex,nonce)||nonce.size()!=32||!HmacSha256(key,nonce,mac))return false;proof=Hex(mac);return true;}
 
 static void ConfigureSocket(SOCKET s){
  BOOL yes=TRUE;DWORD timeout=30000;
@@ -131,15 +116,9 @@ static void ServerLoop(){
  std::thread discovery(DiscoveryLoop);
  while(g_running){
   SOCKET c=accept(ls,nullptr,nullptr);if(c==INVALID_SOCKET){if(!g_running)break;continue;}ConfigureSocket(c);
-  std::string expected,line;int n=WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,nullptr,0,nullptr,nullptr);
-  if(n>1){expected.resize(n);WideCharToMultiByte(CP_UTF8,0,g_pass.c_str(),-1,expected.data(),n,nullptr,nullptr);expected.resize(n-1);}
-  std::vector<UCHAR> nonce(32);if(BCryptGenRandom(nullptr,nonce.data(),(ULONG)nonce.size(),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0){closesocket(c);continue;}
-  if(!SendAll(c,"CHALLENGE "+Hex(nonce)+"\n")||!ReadLine(c,line)||line.rfind("AUTH ",0)!=0){closesocket(c);continue;}
-  std::string proof;if(!MakeProof(expected,Hex(nonce),proof)||line.size()!=5+proof.size()){closesocket(c);continue;}
-  unsigned diff=0;for(size_t i=0;i<proof.size();++i)diff|=(unsigned char)proof[i]^(unsigned char)line[i+5];
-  if(diff!=0||!SendAll(c,"OK\n")){closesocket(c);continue;}
+  std::string line;
   {std::lock_guard<std::mutex>lk(g_sockMutex);g_client=c;}
-  g_connected=true;Ui(L"PC2 подключён и авторизован");Log(L"PC2 подключён.");
+  g_connected=true;Ui(L"PC2 подключён напрямую по Ethernet");Log(L"PC2 подключён без парольной авторизации.");
   while(g_running&&g_connected){
    if(g_taskActive){std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
    fd_set set;FD_ZERO(&set);FD_SET(c,&set);timeval tv{1,0};int ready=select(0,&set,nullptr,nullptr,&tv);
@@ -152,22 +131,32 @@ static void ServerLoop(){
  if(discovery.joinable())discovery.join();
  if(ls!=INVALID_SOCKET)closesocket(ls);g_listener=INVALID_SOCKET;WSACleanup();g_running=false;Ui(L"Сервер остановлен");
 }
+static bool IsGameForeground(){
+ HWND fg=GetForegroundWindow();if(!fg)return false;DWORD pid=0;GetWindowThreadProcessId(fg,&pid);if(!pid)return false;
+ HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!h)return false;
+ wchar_t path[1024]{};DWORD size=(DWORD)_countof(path);BOOL ok=QueryFullProcessImageNameW(h,0,path,&size);CloseHandle(h);if(!ok)return false;
+ const wchar_t* name=wcsrchr(path,L'\\');name=name?name+1:path;
+ static const wchar_t* games[]={L"BlackDesert64.exe",L"BlackDesert32.exe",L"BlackDesert.exe",L"javaw.exe",L"Minecraft.Windows.exe",L"Minecraft.exe",L"Cyberpunk2077.exe",L"Starfield.exe",L"eldenring.exe",L"TslGame.exe",L"r5apex.exe",L"GenshinImpact.exe",L"dota2.exe",L"cs2.exe"};
+ for(const auto* game:games)if(_wcsicmp(name,game)==0)return true;
+ return false;
+}
 static void RunDistributedTest(){
  SOCKET s;{std::lock_guard<std::mutex>lk(g_sockMutex);s=g_client;}
  if(!g_connected||s==INVALID_SOCKET){MessageBoxW(nullptr,L"Сначала подключите PC2.",L"Нет вычислительного узла",MB_ICONWARNING);return;}
  CpuLoad();std::this_thread::sleep_for(std::chrono::milliseconds(250));double localCpu=CpuLoad();double remoteCpu=g_remoteCpu.load();
  double localMem=MemoryLoad(),remoteMem=g_remoteMem.load();
- double localFree=std::max(3.0,100.0-localCpu)*std::max(5.0,100.0-localMem)/100.0;
- double remoteFree=std::max(3.0,100.0-remoteCpu)*std::max(5.0,100.0-remoteMem)/100.0;
+ bool gameForeground=IsGameForeground();
+ double localFree=std::max(0.02,1.0-localCpu/100.0)*std::max(0.05,1.0-localMem/100.0)*std::max(1u,CpuThreads());
+ double remoteFree=std::max(0.02,1.0-remoteCpu/100.0)*std::max(0.05,1.0-remoteMem/100.0)*std::max(1u,g_remoteThreads.load());
  double remoteShare=remoteFree/(localFree+remoteFree);
- if(remoteCpu>90.0||remoteMem>92.0)remoteShare=0.10;
- if(localCpu>92.0&&remoteCpu<80.0&&remoteMem<85.0)remoteShare=0.80;
- remoteShare=std::clamp(remoteShare,0.15,0.80);
+ if(remoteCpu>92.0||remoteMem>94.0)remoteShare=0.0;
+ remoteShare=std::clamp(remoteShare,0.0,0.95);
+ if(gameForeground&&remoteCpu<90.0&&remoteMem<92.0)remoteShare=1.0;
  uint64_t startN=2,span=TEST_END-startN+1;
  uint64_t remoteCount=(uint64_t)(span*remoteShare);
  uint64_t split=TEST_END-remoteCount;
  if(split<startN)split=startN;
- g_taskActive=true;Ui(L"Распределяю задачу по текущей загрузке CPU...");
+ g_taskActive=true;Ui(gameForeground?L"Обнаружена игра на PC1: локальную вычислительную нагрузку переношу на PC2.":L"Распределяю задачу по свободным CPU-потокам...");
  auto started=std::chrono::steady_clock::now();
  if(!SendAll(s,"TASK PRIME "+std::to_string(split+1)+" "+std::to_string(TEST_END)+"\n")){g_taskActive=false;Ui(L"Не удалось отправить задачу PC2");return;}
  uint64_t local=CountPrimes(startN,split);
@@ -186,15 +175,13 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
  switch(m){
  case WM_CREATE:
   CreateWindowW(L"STATIC",L"PC1 — координатор и адаптивный планировщик",WS_CHILD|WS_VISIBLE,20,15,500,25,w,nullptr,nullptr,nullptr);
-  CreateWindowW(L"STATIC",L"Общий пароль:",WS_CHILD|WS_VISIBLE,20,53,100,22,w,nullptr,nullptr,nullptr);
-  g_password=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"change-this-password",WS_CHILD|WS_VISIBLE|ES_PASSWORD,125,50,220,25,w,(HMENU)10,nullptr,nullptr);
-  CreateWindowW(L"BUTTON",L"Запустить сервер",WS_CHILD|WS_VISIBLE,20,90,140,32,w,(HMENU)1,nullptr,nullptr);
-  CreateWindowW(L"BUTTON",L"Остановить",WS_CHILD|WS_VISIBLE,170,90,110,32,w,(HMENU)2,nullptr,nullptr);
-  CreateWindowW(L"BUTTON",L"Тест распределения",WS_CHILD|WS_VISIBLE,290,90,170,32,w,(HMENU)3,nullptr,nullptr);
-  g_status=CreateWindowW(L"STATIC",L"Сервер не запущен",WS_CHILD|WS_VISIBLE,20,137,540,35,w,nullptr,nullptr,nullptr);
-  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,180,540,210,w,nullptr,nullptr,nullptr);return 0;
+  CreateWindowW(L"BUTTON",L"Запустить сервер",WS_CHILD|WS_VISIBLE,20,55,140,32,w,(HMENU)1,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Остановить",WS_CHILD|WS_VISIBLE,170,55,110,32,w,(HMENU)2,nullptr,nullptr);
+  CreateWindowW(L"BUTTON",L"Тест распределения",WS_CHILD|WS_VISIBLE,290,55,170,32,w,(HMENU)3,nullptr,nullptr);
+  g_status=CreateWindowW(L"STATIC",L"Сервер не запущен",WS_CHILD|WS_VISIBLE,20,102,540,35,w,nullptr,nullptr,nullptr);
+  g_log=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL,20,145,540,245,w,nullptr,nullptr,nullptr);return 0;
  case WM_COMMAND:
-  if(LOWORD(wp)==1&&!g_running){wchar_t b[256]{};GetWindowTextW(g_password,b,256);if(wcslen(b)<8){MessageBoxW(w,L"Пароль должен содержать не менее 8 символов.",L"Слабый пароль",MB_ICONWARNING);return 0;}g_pass=b;g_running=true;std::thread(ServerLoop).detach();}
+  if(LOWORD(wp)==1&&!g_running){g_running=true;std::thread(ServerLoop).detach();}
   if(LOWORD(wp)==2&&g_running){g_running=false;if(g_listener!=INVALID_SOCKET){shutdown(g_listener,SD_BOTH);closesocket(g_listener);}std::lock_guard<std::mutex>lk(g_sockMutex);if(g_client!=INVALID_SOCKET){shutdown(g_client,SD_BOTH);closesocket(g_client);g_client=INVALID_SOCKET;}g_connected=false;}
   if(LOWORD(wp)==3)std::thread(RunDistributedTest).detach();return 0;
  case WM_DESTROY:
