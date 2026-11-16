@@ -232,44 +232,55 @@ static void Worker(SOCKET s){
  g_connected=false;g_socket=INVALID_SOCKET;closesocket(s);WSACleanup();if(!g_stop){Ui(L"Связь потеряна. Автоматически переподключаюсь...");std::this_thread::sleep_for(std::chrono::seconds(1));std::thread(Connect).detach();}
 }
 static bool DiscoverPC1(std::string& found){
- struct ScanTarget{in_addr local;in_addr broadcast;};
+ struct ScanTarget{in_addr local;in_addr broadcast;unsigned prefix;};
  std::vector<ScanTarget> targets;
  ULONG bytes=16000;
  std::vector<unsigned char> storage(bytes);
  IP_ADAPTER_ADDRESSES* first=(IP_ADAPTER_ADDRESSES*)storage.data();
  ULONG rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);
  if(rc==ERROR_BUFFER_OVERFLOW){storage.resize(bytes);first=(IP_ADAPTER_ADDRESSES*)storage.data();rc=GetAdaptersAddresses(AF_INET,GAA_FLAG_SKIP_ANYCAST|GAA_FLAG_SKIP_MULTICAST|GAA_FLAG_SKIP_DNS_SERVER,nullptr,first,&bytes);}
- if(rc!=NO_ERROR)return false;
+ if(rc!=NO_ERROR){Log(L"Не удалось получить список Ethernet-интерфейсов Windows.");return false;}
  for(auto*ad=first;ad;ad=ad->Next){
-  if(ad->OperStatus!=IfOperStatusUp||ad->IfType==IF_TYPE_SOFTWARE_LOOPBACK)continue;
+  // Direct cable: scan physical Ethernet adapters only, not VPN, loopback or virtual switches.
+  if(ad->OperStatus!=IfOperStatusUp||ad->IfType!=IF_TYPE_ETHERNET_CSMACD)continue;
   for(auto*u=ad->FirstUnicastAddress;u;u=u->Next){
    if(!u->Address.lpSockaddr||u->Address.lpSockaddr->sa_family!=AF_INET)continue;
    auto*ip=(sockaddr_in*)u->Address.lpSockaddr;
    uint32_t host=ntohl(ip->sin_addr.s_addr);
    if(host==0||(host>>24)==127||(host>>28)==14)continue;
    unsigned prefix=u->OnLinkPrefixLength;
-   if(prefix>32)continue;
-   uint32_t mask=prefix==0?0u:(prefix==32?0xffffffffu:(0xffffffffu<<(32-prefix)));
+   if(prefix>30)continue;
+   uint32_t mask=(prefix==0)?0u:(0xffffffffu<<(32-prefix));
    uint32_t broadcast=(host&mask)|(~mask);
-   ScanTarget t{};t.local=ip->sin_addr;t.broadcast.s_addr=htonl(broadcast);
+   ScanTarget t{};t.local=ip->sin_addr;t.broadcast.s_addr=htonl(broadcast);t.prefix=prefix;
    bool duplicate=false;for(const auto&x:targets)if(x.local.s_addr==t.local.s_addr)duplicate=true;
    if(!duplicate)targets.push_back(t);
   }
  }
- if(targets.empty())return false;
+ if(targets.empty()){
+  Log(L"Не найден активный физический Ethernet с IPv4. Проверьте кабель и состояние Ethernet в Windows.");
+  Ui(L"Нет активного Ethernet IPv4. Проверьте кабель; ожидается адрес IPv4 на обоих ПК.");
+  return false;
+ }
  const char msg[]="2PC_DISCOVER_V1";
  for(const auto&t:targets){
+  char localText[INET_ADDRSTRLEN]{};
+  inet_ntop(AF_INET,&t.local,localText,sizeof(localText));
+  std::wstring detail=L"Поиск PC1 через Ethernet ";
+  wchar_t wide[64]{};MultiByteToWideChar(CP_ACP,0,localText,-1,wide,64);detail+=wide;
+  detail+=L"/";detail+=std::to_wstring(t.prefix);Log(detail);
   SOCKET d=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);if(d==INVALID_SOCKET)continue;
   BOOL yes=TRUE;setsockopt(d,SOL_SOCKET,SO_BROADCAST,(const char*)&yes,sizeof(yes));
+  DWORD receiveTimeout=200;setsockopt(d,SOL_SOCKET,SO_RCVTIMEO,(const char*)&receiveTimeout,sizeof(receiveTimeout));
   sockaddr_in local{};local.sin_family=AF_INET;local.sin_addr=t.local;local.sin_port=0;
   if(bind(d,(sockaddr*)&local,sizeof(local))==SOCKET_ERROR){closesocket(d);continue;}
   sockaddr_in directed{};directed.sin_family=AF_INET;directed.sin_port=htons(47820);directed.sin_addr=t.broadcast;
   sockaddr_in limited{};limited.sin_family=AF_INET;limited.sin_port=htons(47820);limited.sin_addr.s_addr=INADDR_BROADCAST;
   if(t.broadcast.s_addr!=t.local.s_addr)sendto(d,msg,(int)sizeof(msg)-1,0,(sockaddr*)&directed,sizeof(directed));
   sendto(d,msg,(int)sizeof(msg)-1,0,(sockaddr*)&limited,sizeof(limited));
-  auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(650);
+  auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(1600);
   while(std::chrono::steady_clock::now()<until){
-   fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{0,100000};
+   fd_set set;FD_ZERO(&set);FD_SET(d,&set);timeval tv{0,200000};
    int ready=select(0,&set,nullptr,nullptr,&tv);
    if(ready>0){
     char buf[64]{};sockaddr_in peer{};int len=sizeof(peer);
