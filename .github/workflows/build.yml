@@ -24,10 +24,15 @@ jobs:
       - name: Rename PC2 executable
         shell: pwsh
         run: Move-Item PC2.exe PC2-Windows-x64.exe
-      - name: Upload applications
+      - name: Upload PC1 executable
         uses: actions/upload-artifact@v4
         with:
-          name: 2-PC-Windows-x64
-          path: |
-            PC1-Windows-x64.exe
-            PC2-Windows-x64.exe
+          name: PC1-Windows-x64
+          path: PC1-Windows-x64.exe
+          if-no-files-found: error
+      - name: Upload PC2 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: PC2-Windows-x64
+          path: PC2-Windows-x64.exe
+          if-no-files-found: error
