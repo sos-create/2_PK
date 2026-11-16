@@ -42,8 +42,28 @@ static double CpuLoad(){
  ULONGLONG ni=cv(i),nk=cv(k),nu=cv(u);double v=0;if(ok){ULONGLONG total=(nk-ok)+(nu-ou),idle=ni-oi;if(total)v=100.0*(double)(total-idle)/(double)total;}oi=ni;ok=nk;ou=nu;return v;
 }
 static double MemoryLoad(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);return GlobalMemoryStatusEx(&m)?(double)m.dwMemoryLoad:0;}
-static bool IsPrime(uint64_t n){if(n<2)return false;if(n%2==0)return n==2;for(uint64_t d=3;d<=n/d;d+=2)if(n%d==0)return false;return true;}
-static uint64_t CountPrimes(uint64_t a,uint64_t b){uint64_t c=0;for(uint64_t n=a;n<=b;++n)if(IsPrime(n))++c;return c;}
+static uint64_t CountPrimes(uint64_t a,uint64_t b){
+ if(b<a||b<2)return 0;a=std::max<uint64_t>(a,2);
+ uint64_t root=1;while(root+1<=b/(root+1))++root;
+ std::vector<uint8_t> baseMark((size_t)root+1,1);std::vector<uint32_t> primes;
+ for(uint64_t p=2;p<=root;++p)if(baseMark[(size_t)p]){
+  primes.push_back((uint32_t)p);
+  if(p<=root/p)for(uint64_t q=p*p;q<=root;q+=p)baseMark[(size_t)q]=0;
+ }
+ constexpr uint64_t BLOCK=1u<<20;uint64_t total=0;
+ for(uint64_t low=a;low<=b;){
+  uint64_t high=std::min<uint64_t>(b,low+BLOCK-1);std::vector<uint8_t> mark((size_t)(high-low+1),1);
+  for(uint64_t p:primes){
+   if(p>high/p)break;
+   uint64_t first=(low/p)*p;if(first<low)first+=p;
+   uint64_t square=p*p;if(first<square)first=square;
+   for(uint64_t n=first;n<=high;n+=p)mark[(size_t)(n-low)]=0;
+  }
+  for(uint8_t v:mark)total+=v!=0;
+  if(high==b)break;low=high+1;
+ }
+ return total;
+}
 static void Worker(SOCKET s){
  auto last=std::chrono::steady_clock::now();
  while(!g_stop){
